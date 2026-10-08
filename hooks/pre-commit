@@ -1,0 +1,41 @@
+#!/bin/sh
+# pre-commit: require `ruff check --fix` to pass on staged .py files.
+# Auto-fixes with --fix, re-stages files that changed, then verifies clean.
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' || true)
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+# Resolve ruff: prefer project venv, then PATH, then uvx fallback.
+if [ -x "chat/.venv/bin/ruff" ]; then
+  RUFF="chat/.venv/bin/ruff"
+elif command -v ruff >/dev/null 2>&1; then
+  RUFF="ruff"
+else
+  RUFF="uvx ruff"
+fi
+
+# shellcheck disable=SC2086
+$RUFF check --fix $STAGED
+FIX_STATUS=$?
+
+# Re-add files that --fix rewrote (per requirement).
+# shellcheck disable=SC2086
+git add -- $STAGED
+
+if [ $FIX_STATUS -ne 0 ]; then
+  echo "pre-commit: ruff check --fix found unfixable issues. Commit blocked." >&2
+  echo "Run '$RUFF check' for details, fix, and retry." >&2
+  exit 1
+fi
+
+# Verify clean after fix.
+# shellcheck disable=SC2086
+$RUFF check $STAGED
+if [ $? -ne 0 ]; then
+  echo "pre-commit: ruff check still failing after --fix. Commit blocked." >&2
+  exit 1
+fi
+
+exit 0
