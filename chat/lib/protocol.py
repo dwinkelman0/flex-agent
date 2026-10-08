@@ -196,6 +196,65 @@ class RocketChatClient:
         resp.raise_for_status()
         return resp.json().get("messages", [])
 
+    def upload_image(
+        self,
+        rid: str,
+        image_path: str,
+        msg: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload ``image_path`` to room ``rid`` and return the confirm response.
+
+        Uses the Rocket.Chat 8.8 two-step flow:
+          1. ``POST /api/v1/rooms.media/{rid}`` uploads the file and returns
+             ``{file: {_id, url}}``.
+          2. ``POST /api/v1/rooms.mediaConfirm/{rid}/{fileId}``` confirms the
+             upload and posts the message. The response contains the final
+             ``message`` object.
+
+        The older ``/api/v1/rooms.upload/{rid}`` endpoint has returned 404
+        since Rocket.Chat 8.0.
+        """
+        import mimetypes
+        import os
+
+        basename = os.path.basename(image_path)
+        mime, _ = mimetypes.guess_type(image_path)
+        if mime is None:
+            mime = "application/octet-stream"
+
+        media_url = f"{self.server_url}/api/v1/rooms.media/{rid}"
+        with open(image_path, "rb") as fh:
+            files = {"file": (basename, fh, mime)}
+            media_resp = self.session.post(
+                media_url,
+                files=files,
+                headers=self._auth_headers(),
+            )
+        try:
+            media_resp.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(
+                f"upload media to room '{rid}' failed "
+                f"(status {media_resp.status_code}): {exc}"
+            ) from exc
+
+        file_id = media_resp.json()["file"]["_id"]
+        confirm_url = f"{self.server_url}/api/v1/rooms.mediaConfirm/{rid}/{file_id}"
+        payload = {"msg": msg or "", "description": msg or ""}
+        confirm_resp = self.session.post(
+            confirm_url,
+            json=payload,
+            headers=self._auth_headers(),
+        )
+        try:
+            confirm_resp.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(
+                f"confirm upload in room '{rid}' failed "
+                f"(status {confirm_resp.status_code}): {exc}"
+            ) from exc
+        return confirm_resp.json()
+
     def poll_dm(
         self,
         rid: str,

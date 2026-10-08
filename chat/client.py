@@ -95,6 +95,60 @@ def dm_post(
         click.echo(format_message(resp))
 
 
+@dm.command("post-image")
+@click.argument("username")
+@click.argument("image_path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--message",
+    "caption",
+    default=None,
+    help="Optional caption / description sent alongside the image.",
+)
+@click.option(
+    "--server", default=None, envvar="ROCKETCHAT_URL", help="Rocket.Chat server URL."
+)
+def dm_post_image(
+    username: str,
+    image_path: str,
+    caption: str | None,
+    server: str | None,
+) -> None:
+    """Upload IMAGE_PATH to the DM room with USERNAME.
+
+    The image is posted to the room via ``/api/v1/rooms.upload/{rid}``.
+    ``--message`` (if provided) is used as both the caption and description.
+    """
+    server_url = _resolve_server(server)
+    username_me, password = _resolve_creds()
+
+    client = RocketChatClient(server_url)
+    try:
+        client.login(username_me, password)
+    except (requests.RequestException, RuntimeError, TypeError) as exc:
+        click.echo(f"error: login failed: {exc}", err=True)
+        sys.exit(3)
+
+    try:
+        try:
+            rid = client.ensure_dm(username)
+            resp = client.upload_image(rid, image_path, msg=caption)
+        except (requests.RequestException, RuntimeError, TypeError) as exc:
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(3)
+    finally:
+        try:
+            client.logout()
+        except (requests.RequestException, RuntimeError) as exc:
+            click.echo(f"warning: logout failed: {exc}", err=True)
+
+    message = resp.get("message") or {}
+    if message.get("_id"):
+        click.echo(format_message(message))
+    else:
+        # No message object (e.g. raw upload response); fall back to full JSON.
+        click.echo(format_message(resp))
+
+
 @dm.command("listen")
 @click.argument("username")
 @click.option(
