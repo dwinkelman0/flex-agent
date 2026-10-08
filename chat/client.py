@@ -15,12 +15,15 @@ Authentication resolution:
 from __future__ import annotations
 
 import os
+import signal
 import sys
+import threading
 
 import click
 import requests
 from lib import config
 from lib.protocol import RocketChatClient
+from lib.realtime import watch_room
 from lib.util import format_message, now_iso
 
 
@@ -321,6 +324,87 @@ def dm_list_recent(
 
         for msg in peer_msgs:
             click.echo(format_message(msg))
+    finally:
+        try:
+            client.logout()
+        except (requests.RequestException, RuntimeError) as exc:
+            click.echo(f"warning: logout failed: {exc}", err=True)
+
+
+@dm.command("watch")
+@click.argument("username")
+@click.option(
+    "--server", default=None, envvar="ROCKETCHAT_URL", help="Rocket.Chat server URL."
+)
+@click.option(
+    "--timeout",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help="Seconds to watch (0 = forever). Exits 0 on timeout or KeyboardInterrupt.",
+)
+def dm_watch(username: str, server: str | None, timeout: float) -> None:
+    """Push alternative to ``dm listen``: subscribe to the DM room via DDP.
+
+    Connects to the server's ``/websocket`` endpoint, resume-logs in with the
+    REST ``authToken``, and subscribes to ``stream-room-messages`` for the
+    room with ``USERNAME``. Each incoming peer message is printed as a JSON
+    line via ``format_message`` (includes ``ts`` and ``age_seconds``).
+    Messages authored by the current user are skipped.
+
+    Unlike ``dm listen``, this command does not poll; it waits on the
+    WebSocket for server-pushed frames. Server ``ping`` frames are answered
+    with ``pong`` and the connection reconnects with backoff on drop.
+    """
+    server_url = _resolve_server(server)
+    username_me, password = _resolve_creds()
+
+    client = RocketChatClient(server_url)
+    try:
+        client.login(username_me, password)
+    except (requests.RequestException, RuntimeError, TypeError) as exc:
+        click.echo(f"error: login failed: {exc}", err=True)
+        sys.exit(3)
+
+    self_user_id = client.user_id or ""
+    auth_token = client.auth_token or ""
+
+    try:
+        try:
+            rid = client.ensure_dm(username)
+        except (requests.RequestException, RuntimeError, TypeError) as exc:
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(3)
+
+        def _emit(msg: dict) -> None:
+            click.echo(format_message(msg))
+
+        effective_timeout: float | None = None if timeout <= 0 else timeout
+        # First Ctrl-C stops the watch promptly (recv windows are <=5s);
+        # a second Ctrl-C while tearing down still raises.
+        stop = threading.Event()
+        prev_sigint = signal.getsignal(signal.SIGINT)
+
+        def _stop_on_sigint(signum: int, frame: object) -> None:
+            stop.set()
+
+        signal.signal(signal.SIGINT, _stop_on_sigint)
+        try:
+            watch_room(
+                server_url=server_url,
+                auth_token=auth_token,
+                user_id=self_user_id,
+                rid=rid,
+                self_user_id=self_user_id,
+                on_message=_emit,
+                stop_event=stop,
+                timeout=effective_timeout,
+            )
+        except KeyboardInterrupt:
+            # Clean exit on Ctrl-C (e.g. second press during teardown).
+            pass
+        finally:
+            signal.signal(signal.SIGINT, prev_sigint)
     finally:
         try:
             client.logout()

@@ -11,8 +11,12 @@
  * Hooks (opencode 1.18 bus events):
  *   permission.updated → "?? <title>"      (deduped by permission id)
  *   session.error      → "❌ <error>"     (deduped by error id)
- *   session.idle       → turn summary      (last assistant text, ~800 chars)
- *   session.status     → same, when status.type === "idle"
+ *   message.updated    → completed assistant messages are forwarded
+ *                         immediately, one Rocket.Chat message per text
+ *                         block, so long turns stay visible as they land
+ *   session.idle       → fallback: forwards any assistant blocks not yet
+ *                         posted (each its own message, plain text, no marker)
+ *   session.status     → same as session.idle when status.type === "idle"
  *
  * All outbound posts shell out to `python <repo>/chat/client.py dm post`
  * via the ctx `$`. Repo root is resolved relative to this plugin file, not
@@ -32,6 +36,38 @@ import { existsSync } from "node:fs"
 
 const VENV_PY = path.join(REPO_ROOT, "chat", ".venv", "bin", "python")
 const PYTHON = existsSync(VENV_PY) ? VENV_PY : "python3"
+
+// The opencode server this plugin runs inside (loopback). Only root
+// sessions (no parentID) are forwarded — child/subagent sessions post their
+// internal coordination chatter (DONE summaries, verifier JSON) here
+// otherwise, which does not belong in the chat window.
+const OPENCODE_PORT = process.env.OPENCODE_PORT ?? "4096"
+const rootCache = new Map<string, boolean>()
+
+async function isRootSession(sessionID: string): Promise<boolean> {
+  const cached = rootCache.get(sessionID)
+  if (cached !== undefined) return cached
+  try {
+    const res = await fetch(`http://127.0.0.1:${OPENCODE_PORT}/session/${sessionID}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const body = (await res.json()) as { parentID?: string | null }
+    const root = body.parentID == null
+    rootCache.set(sessionID, root)
+    if (rootCache.size > MAX_SEEN) {
+      const first = rootCache.keys().next()
+      if (!first.done) rootCache.delete(first.value)
+    }
+    return root
+  } catch (err) {
+    // Fail closed: an unverifiable session is treated as a child and its
+    // output stays out of the chat window. A failed loopback lookup is loud
+    // (always logged, not debug-gated) so a misconfigured OPENCODE_PORT
+    // cannot silently swallow user-visible replies — if you see this line
+    // and expected a post, check the port.
+    log(`session parent lookup FAILED for ${sessionID}; suppressing post:`, err)
+    return false
+  }
+}
 
 // --- Logging ----------------------------------------------------------------
 // All state transitions go to stderr (console.error) so they appear live when
@@ -67,13 +103,9 @@ function markSeen(id: string): boolean {
   return false
 }
 
-// --- Truncation -------------------------------------------------------------
-const SUMMARY_CAP = 800
-
-function truncate(s: string, cap = SUMMARY_CAP): string {
-  if (s.length <= cap) return s
-  return s.slice(0, cap).trimEnd() + "…"
-}
+// NOTE: no truncation here by design. Blocks are forwarded whole; concision
+// is the agent's job, enforced via agent/AGENTS.md (prompt layer), not by
+// silently cutting text mid-word in the transport.
 
 // --- Assistant-text tracker -------------------------------------------------
 // Text parts stream without a role field, so we record the role per message
@@ -97,23 +129,34 @@ function trackPartText(messageID: string, text: string): void {
   textByMessage.set(messageID, text)
 }
 
-function takeAssistantText(sessionID: string): { text: string; lastID: string } {
+// Per-block posting state: messageIDs already forwarded as their own
+// Rocket.Chat message. Idle only forwards blocks missing from this set,
+// so completed messages post progressively and idle never duplicates.
+const postedBlocks = new Set<string>()
+
+// MessageIDs with a debounce timer in flight (see message.updated). Guards
+// against scheduling duplicate timers for repeated completion events.
+const pendingDebounce = new Set<string>()
+
+function markPosted(messageID: string): void {
+  postedBlocks.add(messageID)
+  if (postedBlocks.size > MAX_SEEN) {
+    const arr = [...postedBlocks]
+    for (const k of arr.slice(0, arr.length - MAX_SEEN)) postedBlocks.delete(k)
+  }
+}
+
+/** Assistant text blocks in session order that have not been posted yet. */
+function unpostedBlocks(sessionID: string): { id: string; text: string }[] {
   const order = orderBySession.get(sessionID) ?? []
-  const chunks: string[] = []
-  let lastID = ""
+  const out: { id: string; text: string }[] = []
   for (const mid of order) {
     if (roleByMessage.get(mid) !== "assistant") continue
+    if (postedBlocks.has(mid)) continue
     const t = textByMessage.get(mid)
-    if (t) {
-      chunks.push(t)
-      lastID = mid
-    }
+    if (t) out.push({ id: mid, text: t })
   }
-  // Consume so a second idle for the same turn emits nothing.
-  for (const mid of order) {
-    textByMessage.delete(mid)
-  }
-  return { text: chunks.join("\n\n"), lastID }
+  return out
 }
 
 // --- Plugin entry -----------------------------------------------------------
@@ -122,7 +165,7 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
   if (!peer) {
     log("PEER_USERNAME not set; outbound posts will be skipped")
   }
-  log(`plugin loaded client=${CLIENT_PY} peer=${peer || "(unset)"}`)
+  log(`plugin loaded client=${CLIENT_PY} peer=${peer || "(unset)"} opcode-port=${OPENCODE_PORT}`)
 
   async function postMessage(kind: string, text: string): Promise<void> {
     if (!peer) return
@@ -142,12 +185,65 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
       const props = (event.properties ?? {}) as Record<string, unknown>
 
       // Track message roles (assistant vs user) for the turn assembler.
+      // A completed assistant message is forwarded immediately as its own
+      // post so long-running turns stay visible instead of going silent.
       if (t === "message.updated") {
         const info = props.info as
-          | { id?: string; sessionID?: string; role?: string }
+          | {
+              id?: string
+              sessionID?: string
+              role?: string
+              time?: { completed?: number }
+            }
           | undefined
         if (info?.id && info?.sessionID && info?.role) {
           trackMessage(info.sessionID, info.id, info.role)
+          if (
+            info.role === "assistant" &&
+            info.time?.completed &&
+            !postedBlocks.has(info.id) &&
+            !pendingDebounce.has(info.id)
+          ) {
+            // `completed` can fire before the last text parts arrive, so
+            // wait for a quiet period before posting. At most two rounds;
+            // then post whatever we have (idle remains a backstop, and the
+            // postedBlocks claim below keeps it from duplicating us).
+            const sid = info.sessionID
+            const mid = info.id
+            const attempt = (round: number): void => {
+              const snapshot = textByMessage.get(mid)
+              setTimeout(() => {
+                pendingDebounce.delete(mid)
+                const current = textByMessage.get(mid)
+                if (!current || postedBlocks.has(mid)) return
+                if (current !== snapshot && round < 2) {
+                  pendingDebounce.add(mid)
+                  attempt(round + 1)
+                  return
+                }
+                void (async () => {
+                  if (!(await isRootSession(sid))) {
+                    debug(`skip completed message from child session ${sid}`)
+                    markPosted(mid)
+                    return
+                  }
+                  // Re-check: idle may have posted this block while we awaited.
+                  if (postedBlocks.has(mid)) return
+                  const id = `${sid}:${mid}`
+                  if (markSeen(id)) return
+                  markPosted(mid)
+                  log(`event message completed session=${sid} chars=${current.length}`)
+                  await postMessage("turn", current)
+                })()
+              }, 1500)
+            }
+            if (textByMessage.get(mid)) {
+              pendingDebounce.add(mid)
+              attempt(1)
+            } else {
+              debug(`completed message ${mid} has no tracked text yet`)
+            }
+          }
         } else {
           debug("message.updated without info.id/sessionID/role")
         }
@@ -169,6 +265,11 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
 
       // permission.updated → "??" (1.18 has no permission.asked event)
       if (t === "permission.updated") {
+        const sid = (props as { sessionID?: string }).sessionID
+        if (sid && !(await isRootSession(sid))) {
+          debug(`skip permission from child session ${sid}`)
+          return
+        }
         const perm = props as unknown as {
           id?: string
           title?: string
@@ -190,6 +291,11 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
 
       // session.error → "❌"
       if (t === "session.error") {
+        const errSid = props.sessionID as string | undefined
+        if (errSid && !(await isRootSession(errSid))) {
+          debug(`skip error from child session ${errSid}`)
+          return
+        }
         const id =
           (props.errorID as string | undefined) ??
           (props.id as string | undefined) ??
@@ -223,19 +329,35 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
           debug("idle without sessionID; skipping")
           return
         }
-        const { text, lastID } = takeAssistantText(sessionID)
-        const id = `${sessionID}:${lastID || Date.now()}`
+        if (!(await isRootSession(sessionID))) {
+          debug(`skip idle from child session ${sessionID}`)
+          for (const mid of orderBySession.get(sessionID) ?? []) {
+            markPosted(mid)
+            textByMessage.delete(mid)
+          }
+          return
+        }
+        // Fallback: forward any assistant blocks the per-message path has
+        // not posted yet — each as its own message, plain text, no marker.
+        const pending = unpostedBlocks(sessionID)
+        if (pending.length === 0) {
+          debug(`idle session=${sessionID} with nothing new; skipping`)
+          return
+        }
+        const id = `${sessionID}:${pending.map((b) => b.id).join(",")}`
         if (markSeen(id)) {
           debug(`dedupe skip idle id=${id}`)
           return
         }
-        if (!text) {
-          debug(`idle session=${sessionID} with no assistant text; nothing to forward`)
-          return
+        log(`event idle session=${sessionID} blocks=${pending.length}`)
+        for (const block of pending) {
+          markPosted(block.id)
+          await postMessage("turn", block.text)
         }
-        const summary = truncate(text)
-        log(`event idle session=${sessionID} chars=${summary.length}`)
-        await postMessage("turn", `💬 ${summary}`)
+        // Drop consumed text so later idles stay silent.
+        for (const mid of orderBySession.get(sessionID) ?? []) {
+          textByMessage.delete(mid)
+        }
         return
       }
 

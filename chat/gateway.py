@@ -19,7 +19,7 @@ Dispatch semantics:
 
 Exit codes:
 
-* ``0`` — only on ``KeyboardInterrupt`` (clean shutdown).
+* ``0`` — only on ``KeyboardInterrupt`` / ``SIGTERM`` (clean shutdown).
 * ``2`` — configuration / usage error (``click.UsageError`` / ``click.ClickException``).
 * ``3`` — runtime error (``requests.RequestException``, ``RuntimeError``, ``TypeError``).
 """
@@ -29,14 +29,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import signal
 import sys
+import threading
+import time
 from typing import Any
 
 import click
 import requests
+import websocket
 from client import _find_backlog
 from lib import config
 from lib.protocol import RocketChatClient
+from lib.realtime import watch_room
 from lib.util import now_iso
 from requests.auth import HTTPBasicAuth
 
@@ -157,7 +163,9 @@ class _OpenCodeDispatcher:
         if self.session_id is None:
             return
         url = f"{self.base_url}/session/{self.session_id}"
-        resp = requests.delete(url, auth=self.auth, timeout=30)
+        # Short timeout: dispose runs during teardown races when the server
+        # may already be half-dead; never let it stall shutdown.
+        resp = requests.delete(url, auth=self.auth, timeout=10)
         resp.raise_for_status()
         self.session_id = None
 
@@ -196,14 +204,14 @@ def _dispatch(
     default=60.0,
     show_default=True,
     type=float,
-    help="Seconds for each poll window before the loop iterates again.",
+    help="Seconds for each fallback poll window (used only if push drops).",
 )
 @click.option(
     "--interval",
     default=1.5,
     show_default=True,
     type=float,
-    help="Seconds between poll requests inside a single poll window.",
+    help="Seconds between poll requests inside a fallback poll window.",
 )
 @click.option(
     "--since",
@@ -247,15 +255,18 @@ def main(
 ) -> None:
     """Outer loop: listen for DMs from PEER and dispatch each hit as a prompt.
 
-    Runs ``dm listen`` in-process against PEER forever. On a hit, performs one
-    extra non-blocking history fetch to batch siblings, then dispatches the
-    concatenated prompt (``[@ts] user: text`` lines) either to an opencode
-    server (``--opencode-url``) or to stdout (``--dry-run`` or no URL).
+    Subscribes to the DM room via push (``dm watch``/DDP) forever. On startup
+    a single backlog check covers messages sent while the gateway was down.
+    On a hit, performs one extra non-blocking history fetch to batch
+    siblings, then dispatches the concatenated prompt (``[@ts] user: text``
+    lines) either to an opencode server (``--opencode-url``) or to stdout
+    (``--dry-run`` or no URL). If push drops, falls back to one poll window
+    (``--timeout``/``--interval``) before resubscribing.
 
     Exit codes: 0 only on Ctrl-C; 2 on config/usage errors; 3 on runtime errors.
 
     State is observable via stderr logs (stdout stays pure prompt-JSON in
-    dry-run mode). Use --log-level DEBUG to watch every poll/dispatch.
+    dry-run mode). Use --log-level DEBUG to watch every hit/dispatch.
     With --ephemeral the opencode session is DELETEed on shutdown.
     """
     log = _setup_logging(log_level)
@@ -279,9 +290,16 @@ def main(
             "basic" if oc_password else "none",
         )
 
+    stop = threading.Event()
+
     def _shutdown(reason: str) -> None:
         log.info("shutdown (%s)", reason)
-        if dispatcher is not None and ephemeral:
+        stop.set()
+        if (
+            dispatcher is not None
+            and ephemeral
+            and dispatcher.session_id is not None
+        ):
             try:
                 sid = dispatcher.session_id
                 dispatcher.dispose()
@@ -295,6 +313,23 @@ def main(
             log.warning("rocketchat logout failed: %s", exc)
 
     client = RocketChatClient(server_url)
+
+    shutdown_reason = "ctrl-c"
+    shutting_down = False
+
+    def _sigterm_handler(signum: int, frame: object) -> None:
+        # Translate SIGTERM into the same graceful path as Ctrl-C so the
+        # opencode session is disposed (with --ephemeral) and RC logged out.
+        # Idempotent: a second signal during teardown exits immediately
+        # instead of raising inside interpreter finalization (traceback).
+        nonlocal shutdown_reason, shutting_down
+        if shutting_down:
+            os._exit(128 + signum)
+        shutting_down = True
+        shutdown_reason = "sigterm"
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
         client.login(username_me, password)
         log.info("rocketchat login ok user=%s", username_me)
@@ -309,48 +344,13 @@ def main(
             raise click.ClickException(f"ensure_dm({peer!r}) failed: {exc}") from exc
 
         since: str = since_floor if since_floor is not None else now_iso()
-        log.info("listening since=%s timeout=%s interval=%s", since, timeout, interval)
+        log.info("push-subscribed DM peer=%s rid=%s since=%s", peer, rid, since)
         seen_ids: set[str] = set()
+        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
 
-        while True:
-            # Backlog pre-check: oldest peer message at/after `since`.
-            backlog = _find_backlog(client, rid, username_me, since)
-            if backlog is not None and backlog.get("_id") in seen_ids:
-                log.debug(
-                    "backlog hit already dispatched id=%s; treating as miss",
-                    backlog.get("_id"),
-                )
-                backlog = None
-            primary: dict[str, Any] | None = None
-            if backlog is not None:
-                primary = backlog
-                log.info(
-                    "backlog hit id=%s ts=%s",
-                    backlog.get("_id"),
-                    backlog.get("ts"),
-                )
-            else:
-                log.debug("poll window start timeout=%s", timeout)
-                try:
-                    primary = client.poll_dm(
-                        rid,
-                        since_iso=since,
-                        timeout=timeout,
-                        interval=interval,
-                    )
-                except (requests.RequestException, RuntimeError, TypeError) as exc:
-                    raise click.ClickException(f"poll failed: {exc}") from exc
-                if primary is not None:
-                    log.info(
-                        "poll hit id=%s ts=%s", primary.get("_id"), primary.get("ts")
-                    )
-
-            if primary is None:
-                # Timeout: loop again immediately; keep `since` so nothing is missed.
-                log.debug("poll timeout; re-entering listen")
-                continue
-
-            # Spontaneous batching: one non-blocking sibling fetch.
+        def _dispatch_primary(primary: dict[str, Any]) -> None:
+            """Batch siblings around `primary` and dispatch as one prompt."""
+            nonlocal since
             siblings = _fetch_siblings(client, rid, primary, since)
             siblings = [m for m in siblings if m.get("_id") not in seen_ids]
             if not siblings:
@@ -360,14 +360,13 @@ def main(
                 if primary_ts and primary_ts >= since:
                     since = primary_ts
                 log.debug("all siblings already seen; floor now %s", since)
-                continue
+                return
             payload = _build_prompt(peer, siblings)
             log.info(
                 "dispatching %d message(s) latest_ts=%s",
                 len(siblings),
                 max((m.get("ts") or "" for m in siblings), default=""),
             )
-
             try:
                 _dispatch(dispatcher, payload, dry_run=dry_run)
                 if dispatcher is not None and not dry_run:
@@ -376,7 +375,6 @@ def main(
                     log.info("dry-run prompt printed to stdout")
             except (requests.RequestException, RuntimeError, TypeError) as exc:
                 raise click.ClickException(f"dispatch failed: {exc}") from exc
-
             # Advance the floor past the latest dispatched message.
             latest_ts = max((m.get("ts") or "" for m in siblings), default="")
             since = latest_ts or now_iso()
@@ -384,8 +382,115 @@ def main(
                 if m.get("_id"):
                     seen_ids.add(str(m.get("_id")))
             log.debug("floor advanced to %s (seen=%d)", since, len(seen_ids))
+
+        def _refresh_login() -> tuple[str, str]:
+            """Re-login via REST so pushes/polls use a fresh auth token.
+
+            Tokens can be rotated or expire (e.g. server restart); reusing
+            the startup token forever ends in an unrecoverable auth crash
+            loop. Called before every (re)subscribe and fallback poll.
+            """
+            try:
+                uid, token = client.login(username_me, password)
+            except (requests.RequestException, RuntimeError, TypeError) as exc:
+                raise click.ClickException(f"re-login failed: {exc}") from exc
+            log.debug("auth token refreshed user=%s", username_me)
+            return uid, token
+
+        def _start_watcher() -> threading.Thread:
+            """Run one push subscription in a daemon thread; errors -> inbox."""
+
+            def _run() -> None:
+                try:
+                    uid, token = _refresh_login()
+                    watch_room(
+                        server_url,
+                        token,
+                        uid,
+                        rid,
+                        uid,
+                        inbox.put,
+                        stop_event=stop,
+                    )
+                except (
+                    click.ClickException,
+                    RuntimeError,
+                    OSError,
+                    websocket.WebSocketException,
+                ) as exc:
+                    inbox.put({"_watch_error": str(exc)})
+
+            thread = threading.Thread(target=_run, daemon=True)
+            thread.start()
+            return thread
+
+        # Startup catch-up: messages sent while the gateway was down are not
+        # pushed, so check once before subscribing.
+        startup = _find_backlog(client, rid, username_me, since)
+        if startup is not None:
+            log.info(
+                "startup backlog hit id=%s ts=%s",
+                startup.get("_id"),
+                startup.get("ts"),
+            )
+            _dispatch_primary(startup)
+
+        auth_token = client.auth_token
+        user_id = client.user_id
+        if not auth_token or not user_id:
+            raise click.ClickException("login did not yield auth token/user id")
+        _start_watcher()
+
+        while True:
+            # NOTE: sleep-poll, not inbox.get(): on this platform a thread
+            # parked in Queue/lock acquisition does not take SIGINT promptly
+            # (observed 25s+ blackout), while sleep() interrupts immediately.
+            # 0.2s bounds push→dispatch latency.
+            time.sleep(0.2)
+            try:
+                primary = inbox.get_nowait()
+            except queue.Empty:
+                continue
+            if stop.is_set():
+                continue
+            if "_watch_error" in primary:
+                log.warning(
+                    "push unavailable (%s); one fallback poll window",
+                    primary["_watch_error"],
+                )
+                try:
+                    _refresh_login()
+                    fallback = client.poll_dm(
+                        rid,
+                        since_iso=since,
+                        timeout=timeout,
+                        interval=interval,
+                    )
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    raise click.ClickException(f"poll failed: {exc}") from exc
+                _start_watcher()
+                if fallback is None:
+                    log.debug("fallback poll timeout; resubscribed")
+                    continue
+                if fallback.get("_id") in seen_ids:
+                    continue
+                log.info(
+                    "fallback poll hit id=%s ts=%s",
+                    fallback.get("_id"),
+                    fallback.get("ts"),
+                )
+                _dispatch_primary(fallback)
+                continue
+            if primary.get("_id") in seen_ids:
+                log.debug(
+                    "push hit already dispatched id=%s; skipping",
+                    primary.get("_id"),
+                )
+                continue
+            log.info("push hit id=%s ts=%s", primary.get("_id"), primary.get("ts"))
+            _dispatch_primary(primary)
     except KeyboardInterrupt:
-        _shutdown("ctrl-c")
+        _shutdown(shutdown_reason)
         sys.exit(0)
     except click.ClickException:
         _shutdown("error")

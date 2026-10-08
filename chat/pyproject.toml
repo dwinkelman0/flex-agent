@@ -9,4 +9,5 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "requests>=2.34.2",
     "rocket-python>=1.3.4",
+    "websocket-client>=1.8.0",
 ]

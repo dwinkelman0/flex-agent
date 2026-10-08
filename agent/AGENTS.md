@@ -13,10 +13,10 @@ and you exchange DMs; an outer loop relays messages in both directions.
 
 ## Inbound — how messages reach you
 
-You do **not** poll Rocket.Chat yourself. The outer loop owns the long poll:
+You do **not** watch Rocket.Chat yourself. The outer loop owns inbound:
 
-- On startup it runs `python ../chat/client.py dm listen <peer>` and turns
-  each returned message into a prompt delivered to you immediately.
+- On startup it subscribes to the DM room (push) and turns each incoming
+  message into a prompt delivered to you immediately.
 - You can therefore assume: anything in your prompt history from the peer
   has already been dispatched; you don't need to fetch it again for normal
   turns.
@@ -26,7 +26,8 @@ You do **not** poll Rocket.Chat yourself. The outer loop owns the long poll:
 Normal replies are auto-forwarded by the Rocket.Chat plugin wired into this
 agent's opencode config (`agent/.opencode/plugins/rocketchat.ts`):
 
-- Your regular assistant turns become `💬 <summary>` DMs automatically.
+- Each finished assistant message becomes its own DM automatically
+  (plain text, no marker), so multi-block turns arrive as separate messages.
 - Permission prompts become `?? <description>` DMs.
 - Session errors become `❌ <error>` DMs.
 
@@ -60,14 +61,29 @@ python ../chat/client.py dm post-image <peer> /abs/path/to/image.png --message "
 The plugin does **not** auto-forward media; call this directly when you need
 to send an image.
 
-## Tone & prefixes
+## Tone, prefixes & concision
 
-Concise prose. Emoji prefixes are a small, fixed set:
+Your replies post **verbatim** — the transport never truncates, chunks, or
+summarizes. Concision is therefore your responsibility, enforced here, not
+in code:
+
+- Front-load the answer. Details, lists, and reasoning go after, and only
+  if the peer asked or the task needs them. Prefer short messages over
+  long ones; split distinct points across messages rather than one wall
+  of text.
+- Phone-readable: a few sentences per message is the norm. If a reply
+  wants to be long, end the first message with what you'll cover next
+  instead of dumping everything at once.
+- No filler, no preamble ("Great question!"), no progress narration
+  ("I'll search for… now") — progress is visible from your delivered
+  messages, not announced.
+
+Emoji prefixes are a small, fixed set:
 
 - `❓` — input needed from the peer (ask a clarifying question).
 - `❌` — errors and failures.
-- `💬` — normal replies (optional; the plugin adds this automatically for
-  turn summaries, so you usually don't need to prefix yourself).
+- Normal replies carry no marker; the plugin forwards each finished
+  assistant message as its own plain-text DM.
 
 Use one emoji per message, at the start. No emoji salads.
 
