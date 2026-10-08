@@ -190,8 +190,8 @@ class RocketChatClient:
         params: dict[str, Any] = {"roomId": rid, "count": count}
         if oldest is not None:
             params["oldest"] = oldest
-            params["inclusive"] = False
-            params["unreads"] = False
+            params["inclusive"] = "false"
+            params["unreads"] = "false"
         resp = self.session.get(url, params=params, headers=self._auth_headers())
         resp.raise_for_status()
         return resp.json().get("messages", [])
@@ -281,15 +281,33 @@ class RocketChatClient:
             params = {
                 "roomId": rid,
                 "oldest": since_iso,
-                "inclusive": False,
+                "inclusive": "false",
                 "count": 50,
-                "unreads": False,
+                "unreads": "false",
             }
             try:
                 resp = self.session.get(
                     url, params=params, headers=self._auth_headers()
                 )
                 resp.raise_for_status()
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status is not None and 500 <= status <= 599:
+                    print(
+                        f"warning: poll_dm server error ({exc}); retrying",
+                        file=sys.stderr,
+                    )
+                elif status == 429:
+                    print(
+                        f"warning: poll_dm rate-limited ({exc}); retrying",
+                        file=sys.stderr,
+                    )
+                else:
+                    raise
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(interval)
+                continue
             except requests.RequestException as exc:
                 print(
                     f"warning: poll_dm transient error ({exc}); retrying",
