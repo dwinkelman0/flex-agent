@@ -34,6 +34,9 @@ def ejson_to_iso(value: Any) -> Any:
     if isinstance(value, dict):
         if "$date" in value and len(value) == 1:
             ms = value["$date"]
+            # NOTE(first non-timestamp {"$date"} dict observed): converts any
+            # single-key $date dict; a legit non-date payload shaped this way
+            # would silently become a string.
             if isinstance(ms, (int, float)):
                 return datetime.fromtimestamp(ms / 1000.0, tz=UTC).isoformat()
             return value

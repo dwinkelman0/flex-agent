@@ -23,3 +23,20 @@ description: High-signal code review for this repo. Load when asked to review ch
   wrapper PIDs vs python child PIDs, backgrounded shells ignoring SIGINT.
 - Reviewers run fresh-eyes by default: brief them with paths + scope
   only, no session history. Read-only: never edit, return findings.
+
+## Triage findings (tech-debt lens)
+
+Route every finding to exactly one bucket:
+
+- **Fix now**: small fix, or anything already manifestly broken.
+- **1-line NOTE comment**: the select few small risks that could
+  manifestly misbehave under the right conditions — mark the call site
+  with `NOTE(<trigger>): …` where the trigger is the firing condition.
+  Default to NOT commenting; noise is worse than silence.
+- **TECH_DEBT.md candidate**: complex, open-ended, off-critical-path
+  fixes only. Hand to the tech-debt skill (human approves); never write
+  entries from review directly.
+- **Drop**: cosmetic or unlikely — a wishlist is not a tracker.
+
+Trigger evaluation lives primarily in code review, but may run
+out-of-band on request.
