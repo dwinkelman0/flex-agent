@@ -53,7 +53,7 @@ def cli() -> None:
 
 @cli.group()
 def dm() -> None:
-    """Direct-message commands."""
+    """Direct-message commands (post, listen, list-recent)."""
 
 
 @dm.command("post")
@@ -170,6 +170,108 @@ def dm_listen(
         click.echo("timeout", err=True)
         sys.exit(4)
     click.echo(format_message(msg))
+
+
+@dm.command("list-recent")
+@click.argument("username")
+@click.option(
+    "--server", default=None, envvar="ROCKETCHAT_URL", help="Rocket.Chat server URL."
+)
+@click.option(
+    "--count",
+    default=50,
+    show_default=True,
+    type=int,
+    help="Number of recent messages to fetch from history.",
+)
+@click.option(
+    "--since",
+    "since_floor",
+    default=None,
+    help=(
+        "ISO-8601 timestamp used as a lower bound. Combined with the agent's last "
+        "message timestamp (max of the two is used as the floor)."
+    ),
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Ignored; output is always one JSON object per line. Kept for interface symmetry.",
+)
+def dm_list_recent(
+    username: str,
+    server: str | None,
+    count: int,
+    since_floor: str | None,
+    as_json: bool,  # reserved for future binary flag
+) -> None:
+    """Reentrance escape hatch for ``dm listen``.
+
+    Fetches the most recent ``COUNT`` messages from the DM room with
+    ``USERNAME``. Finds the agent's own last message in that window (matched
+    by ``user_id`` / agent username) and prints every message authored by
+    ``USERNAME`` with ``ts`` strictly greater than the agent's last message
+    ``ts``, sorted ascending.
+
+    If the agent has no message in the window, prints every peer message in
+    the window (documented fallback). If ``--since`` is given, it is used as
+    an additional floor (max of the two). Output is one JSON line per
+    message via ``format_message`` (includes ``ts`` and ``age_seconds``).
+    Exits 0 (silent on stdout) when there are no new messages.
+    """
+    server_url = _resolve_server(server)
+    username_me, password = _resolve_creds()
+
+    client = RocketChatClient(server_url)
+    try:
+        client.login(username_me, password)
+    except (requests.RequestException, RuntimeError, TypeError) as exc:
+        click.echo(f"error: login failed: {exc}", err=True)
+        sys.exit(3)
+
+    try:
+        try:
+            rid = client.ensure_dm(username)
+            messages = client.fetch_im_history(rid, oldest=None, count=count)
+        except (requests.RequestException, RuntimeError, TypeError) as exc:
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(3)
+
+        # Find agent's own last message ts in the window.
+        self_ts: str | None = None
+        for msg in messages:
+            author_id = msg.get("u", {}).get("_id") or msg.get("userId")
+            if author_id == client.user_id:
+                msg_ts = msg.get("ts") or ""
+                if self_ts is None or msg_ts > self_ts:
+                    self_ts = msg_ts
+
+        # Floor: max(agent_last_ts, --since).
+        floor: str | None = self_ts if self_ts is not None else since_floor
+        if self_ts is not None and since_floor is not None:
+            floor = max(self_ts, since_floor)
+        elif since_floor is not None:
+            floor = since_floor
+
+        # Filter: peer messages with ts > floor.
+        peer_msgs = [
+            m
+            for m in messages
+            if (m.get("u", {}).get("_id") or m.get("userId")) != client.user_id
+        ]
+        if floor is not None:
+            peer_msgs = [m for m in peer_msgs if (m.get("ts") or "") > floor]
+        peer_msgs.sort(key=lambda m: m.get("ts") or "")
+
+        for msg in peer_msgs:
+            click.echo(format_message(msg))
+    finally:
+        try:
+            client.logout()
+        except (requests.RequestException, RuntimeError) as exc:
+            click.echo(f"warning: logout failed: {exc}", err=True)
 
 
 def _find_backlog(
