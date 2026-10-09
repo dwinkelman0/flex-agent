@@ -70,3 +70,26 @@ JSON is printed to stdout.
 
 Exit codes: `0` only on Ctrl-C; `2` on config/usage errors; `3` on
 runtime errors.
+
+## Server persistence — where Rocket.Chat files live on the host
+
+The server runs via `../rocketchat-compose.yml` (mongo + Rocket.Chat +
+NATS; see that file's header). All state survives container replacement
+through Docker **named volumes**:
+
+| Volume | Contents |
+|---|---|
+| `rocketchat-compose_mongodb_data` | everything: users, messages, settings, uploads (GridFS) |
+| `rocketchat-minimal_rocketchat_uploads` | filesystem uploads (`/app/uploads`), if any |
+
+On Docker Desktop (Mac), volume data lives **inside the Linux VM**, not
+directly on the macOS filesystem — `/var/lib/docker/volumes/...` paths
+do not exist on the host. Inspect instead with a throwaway container:
+
+```
+docker run --rm -v rocketchat-compose_mongodb_data:/data alpine ls /data
+```
+
+Back up with `mongodump` from the mongo service (see the compose file
+comments in the official docs for the exact command). Never delete
+`rocketchat-compose_mongodb_data` unless the workspace is disposable.

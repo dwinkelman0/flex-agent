@@ -1,0 +1,89 @@
+# Minimal Rocket.Chat 8.8 deployment: database + app + NATS only.
+# (Official docs Step 4 minimal = compose.database.yml + compose.yml +
+# compose.nats.yml; no Traefik, no monitoring stack.)
+#
+# Usage:
+#   docker compose -f rocketchat-compose.yml up -d
+#   docker logs -f rocketchat   # first boot takes a few minutes
+#
+# Persistence: reuses the pre-existing `rocketchat-compose_mongodb_data`
+# external volume, so users/messages/settings survive. Do NOT delete that
+# volume. Uploads default to GridFS inside Mongo (same as before).
+# Pinned versions per docs guidance (don't float on latest for stateful
+# services): Rocket.Chat 8.8.0, MongoDB community 8.2-ubi8.
+
+name: rocketchat-minimal
+
+# Memory budget (2GB plan, Oct 9): measured peaks over load+idle soak —
+# rocketchat 734M, mongodb 264M, nats 13M — limits = peak x1.25 rounded
+# to 64M steps. mem_reservation mirrors mem_limit for honest scheduling.
+# NOTE: mongodb previously OOMed (exit 137) unbounded; the WT cache cap
+# below is what actually bounds it (docs floor 0.256GB).
+
+services:
+  mongodb:
+    image: mongodb/mongodb-community-server:8.2-ubi8
+    command: mongod --oplogSize 128 --replSet rs0 --storageEngine=wiredTiger --wiredTigerCacheSizeGB 0.256
+    mem_limit: 384m
+    mem_reservation: 384m
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh mongodb://localhost:27017/rocketchat --quiet
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  mongodb-init-replica:
+    image: mongodb/mongodb-community-server:8.2-ubi8
+    # Idempotent: succeeds whether the replica set is fresh or already
+    # initiated (existing data volume case).
+    command: >
+      mongosh --host mongodb:27017 --eval '
+        try { rs.status(); } catch (e) {
+          rs.initiate({ _id: "rs0", members: [ { _id: 0, host: "mongodb:27017" } ] });
+        }'
+    depends_on:
+      mongodb:
+        condition: service_started
+    restart: "no"
+
+  nats:
+    image: nats:2.11-alpine
+    mem_limit: 64m
+    mem_reservation: 64m
+    restart: unless-stopped
+
+  rocketchat:
+    image: registry.rocket.chat/rocketchat/rocket.chat:8.8.0
+    mem_limit: 960m
+    mem_reservation: 960m
+    environment:
+      PORT: 3000
+      ROOT_URL: http://localhost:3000
+      # Heap at ~75% of the container limit; the rest is native/external mem.
+      NODE_OPTIONS: --max-old-space-size=720
+      MONGO_URL: mongodb://mongodb:27017/rocketchat?replicaSet=rs0
+      # monolith+ prefix (per official compose.yml): run services in-process
+      # AND bridge via NATS. Bare nats:// breaks room stream subscriptions.
+      TRANSPORTER: monolith+nats://nats:4222
+      DEPLOY_METHOD: docker
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    volumes:
+      - rocketchat_uploads:/app/uploads
+    restart: unless-stopped
+
+volumes:
+  # Pre-existing volume from the previous stack — users, messages, and
+  # settings (incl. admin + 2FA config) live here.
+  mongodb_data:
+    external: true
+    name: rocketchat-compose_mongodb_data
+  rocketchat_uploads: {}
