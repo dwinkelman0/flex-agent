@@ -1,0 +1,31 @@
+# Gitea (git + web UI + issues) for local dev.
+#
+# Usage:
+#   docker compose -f gitea-compose.yml up -d
+#   open http://localhost:3001   # first boot: create the admin user
+#
+# SQLite backend (no DB sidecar): fine for a few users; move to Postgres
+# only if CI concurrency causes SQLITE_BUSY. Memory limits are set in a
+# later calibration step (measured peaks x1.25) — see TECH_DEBT.md /
+# 2GB-budget plan. Ports: 3001 web (3000 belongs to Rocket.Chat),
+# 2222 SSH (22 is host sshd, 8022 is GitLab's leftover mapping).
+# Data (repos, DB, config) persists in gitea_data.
+
+services:
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    # 2GB-budget plan (Oct 9): measured peak 229M over API load exercise
+    # (org/repo skipped — token scopes; user repo + 20 commits + 5 issues
+    # + comments + pagination); limit = peak x1.25 rounded to 64M steps.
+    mem_limit: 320m
+    mem_reservation: 320m
+    ports:
+      - "3001:3000"
+      - "2222:22"
+    volumes:
+      - gitea_data:/data
+    restart: always
+
+volumes:
+  gitea_data: {}
