@@ -1,13 +1,24 @@
-"""Post to any Rocket.Chat room from an agent session.
+"""Post to any Rocket.Chat room from an agent session, and manage channel
+subscriptions.
 
 Usage::
 
     python channel.py post <room> "text" [--thread TMID]
+    python channel.py subscribe <key>
+    python channel.py unsubscribe <key>
+    python channel.py catalog
 
 ``room`` is a DM username, a ``#channel`` name, or ``rid:<id>``.
+Channel keys look like ``rc:dm:<peer>``, ``rc:room:<rid>``,
+``gitea:issue:<owner>/<repo>#<n>``, ``gitea:repo:<owner>/<repo>``.
 This is the sanctioned toolkit path for reaching non-DM rooms and for
 any agent-initiated (non-plugin) posts. The opencode plugin owns plain
 DM replies; use this tool for everything else (rule (b) turns).
+
+Subscription state lives in ``agent/subscriptions.json`` (gateway-owned
+helpers in ``lib/subscriptions.py``). The dedicated DM is mandatory and
+cannot be unsubscribed. New channels require an explicit accept
+(``subscribe``) or decline (``unsubscribe``); silence decides nothing.
 
 Authentication: ``USERNAME``/``PASSWORD`` env vars or repo-root
 ``.agent_env``. Server: ``--server`` / ``ROCKETCHAT_URL`` / ``../.env``.
@@ -20,8 +31,9 @@ import sys
 
 import click
 import requests
-from lib import config
+from lib import config, subscriptions
 from lib.protocol import RocketChatClient
+from lib.util import now_iso
 
 
 def _resolve_server(server: str | None) -> str:
@@ -122,6 +134,52 @@ def channel_post(room: str, message: str, thread_id: str | None, server: str | N
             client.logout()
         except (requests.RequestException, RuntimeError) as exc:
             click.echo(f"warning: logout failed: {exc}", err=True)
+
+
+def _gateway_peer() -> str | None:
+    """Best-effort gateway peer for the DM-mandatory guard."""
+    return os.environ.get("GATEWAY_PEER")
+
+
+@cli.command("subscribe")
+@click.argument("key")
+def channel_subscribe(key: str) -> None:
+    """Accept a channel subscription (explicit opt-in).
+
+    Accept-on-new replays from the beginning; any other (re)subscribe
+    baselines at now — see lib/subscriptions.py.
+    """
+    _, backfill = subscriptions.subscribe(
+        key, announced=False, now_iso=now_iso()
+    )
+    # Late subscribe: baseline at now so only newer items dispatch. (For
+    # accept-on-new the gateway clears the baseline when it sees the
+    # flip; see gateway discovery tick.)
+    if not backfill:
+        subscriptions.set_baseline(key, now_iso())
+    click.echo(f"subscribed {key} (backfill={'all' if backfill else 'new-only'})")
+
+
+@cli.command("unsubscribe")
+@click.argument("key")
+def channel_unsubscribe(key: str) -> None:
+    """Leave a channel, or decline an undecided announcement.
+
+    The dedicated DM is mandatory and cannot be unsubscribed.
+    """
+    try:
+        result = subscriptions.unsubscribe(key, gateway_peer=_gateway_peer())
+    except ValueError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(2)
+    click.echo(f"{result} {key}")
+
+
+@cli.command("catalog")
+def channel_catalog() -> None:
+    """List channels awaiting an explicit accept/decline decision."""
+    for key in subscriptions.catalog():
+        click.echo(key)
 
 
 if __name__ == "__main__":

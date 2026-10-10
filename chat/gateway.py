@@ -40,7 +40,8 @@ import click
 import requests
 import websocket
 from client import _find_backlog
-from lib import config
+from lib import channels as chanlib
+from lib import config, subscriptions
 from lib.protocol import RocketChatClient
 from lib.realtime import watch_room
 from lib.util import now_iso
@@ -356,7 +357,14 @@ def _dispatch(
     default=5.0,
     show_default=True,
     type=float,
-    help="Seconds between issue-comment polls when --issue is set.",
+    help="Seconds between channel polls (issue comments, room history).",
+)
+@click.option(
+    "--discovery-interval",
+    default=60.0,
+    show_default=True,
+    type=float,
+    help="Seconds between channel discovery/destroy sweeps.",
 )
 def main(
     peer: str,
@@ -370,6 +378,7 @@ def main(
     ephemeral: bool,
     issue_target: str | None,
     issue_interval: float,
+    discovery_interval: float,
 ) -> None:
     """Outer loop: listen for DMs from PEER and dispatch each hit as a prompt.
 
@@ -401,6 +410,15 @@ def main(
     gitea_token: str | None = None
     issue_seen_ids: set[int] = set()
     last_issue_poll = 0.0
+    # Gitea credentials are optional: without them, Gitea discovery and
+    # issue polling are skipped (RC-only setups keep working).
+    gitea_token = os.environ.get("GITEA_TOKEN") or None
+    if not gitea_token:
+        gitea_token = config.load_agent_env().get("GITEA_TOKEN")
+    if not gitea_token:
+        gitea_token = config.load_root_env().get("GITEA_TOKEN") or os.environ.get(
+            "GITEA_TOKEN"
+        )
     if issue_target is not None:
         try:
             repo_part, num_part = issue_target.rsplit("#", 1)
@@ -410,14 +428,6 @@ def main(
             raise click.UsageError(
                 f"--issue must look like OWNER/REPO#N, got {issue_target!r}."
             ) from None
-        # Precedence: env, per-agent .agent_env, then root .env (admin).
-        gitea_token = os.environ.get("GITEA_TOKEN")
-        if not gitea_token:
-            gitea_token = config.load_agent_env().get("GITEA_TOKEN")
-        if not gitea_token:
-            gitea_token = config.load_root_env().get("GITEA_TOKEN") or os.environ.get(
-                "GITEA_TOKEN"
-            )
         if not gitea_token:
             raise click.ClickException(
                 "GITEA_TOKEN not found; set env, run provision_gitea.py, "
@@ -430,6 +440,15 @@ def main(
             issue_number,
             gitea_server,
         )
+        # Migrate the demo flag into subscription state (late semantics:
+        # baseline at now, same as the old dedicated block).
+        subscriptions.subscribe(
+            f"gitea:{issue_owner}/{issue_repo}#{issue_number}",
+            announced=False,
+            now_iso=now_iso(),
+        )
+    # The dedicated DM is mandatory and always active.
+    subscriptions.subscribe(f"rc:dm:{peer}", announced=False, now_iso=now_iso())
     log.info(
         "startup peer=%s server=%s mode=%s ephemeral=%s",
         peer,
@@ -568,6 +587,275 @@ def main(
             log.debug("auth token refreshed user=%s", username_me)
             return uid, token
 
+        def _emit(channel: str, payload: dict[str, Any], rc: bool) -> None:
+            """Shared dispatch + logging for channel prompts."""
+            try:
+                sid = _dispatch(
+                    dispatcher, payload, dry_run=dry_run, channel=channel, rc=rc
+                )
+                if dispatcher is not None and not dry_run:
+                    log.info("dispatched to opencode session=%s", sid)
+                else:
+                    log.info("dry-run prompt printed to stdout")
+            except (requests.RequestException, RuntimeError, TypeError) as exc:
+                raise click.ClickException(f"dispatch failed: {exc}") from exc
+
+        def _dispatch_control(kind: str, key: str, detail: str = "") -> None:
+            """Lifecycle notices to the agent (never data, never RC-routed).
+
+            Recorded rc=False so the plugin stays silent per rule (b).
+            """
+            payload = {
+                "peer": "control",
+                "prompt": chanlib.control_prompt(kind, key, detail),
+                "messages": 0,
+            }
+            log.info("control %s %s", kind, key)
+            _emit("control", payload, rc=False)
+
+        # Per-channel runtime poll state (cursors live here; decisions in
+        # subscriptions.json). The demo --issue path keeps its own legacy
+        # seen-set below; the generic engine skips that key to avoid
+        # double delivery.
+        demo_key = (
+            f"gitea:{issue_owner}/{issue_repo}#{issue_number}"
+            if issue_target is not None
+            and issue_owner is not None
+            and issue_repo is not None
+            and issue_number is not None
+            else None
+        )
+        chan_state: dict[str, dict[str, Any]] = {}
+        room_types: dict[str, str] = {}
+        last_discovery = 0.0
+        last_channel_poll = 0.0
+
+        def _backfill_channel(key: str, entry: dict[str, Any]) -> None:
+            """Accept path: replay-then-baseline, dispatched as one prompt."""
+            parsed_issue = chanlib.parse_issue_key(key)
+            if parsed_issue is not None and gitea_token is not None:
+                owner, repo, number = parsed_issue
+                try:
+                    comments = chanlib.backfill_gitea_issue(
+                        gitea_server, gitea_token, owner, repo, number
+                    )
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("backfill %s failed: %s", key, exc)
+                    return
+                others = [
+                    c
+                    for c in comments
+                    if ((c.get("user") or {}).get("login") or "") != username_me
+                ]
+                if others:
+                    latest = max(int(c["id"]) for c in others if isinstance(c.get("id"), int))
+                    payload = _build_prompt(
+                        key,
+                        [_comment_as_message(c) for c in others],
+                        channel=key,
+                        inbound="backfill " + ", ".join(f"comment {c.get('id')}" for c in others),
+                        suggested=(
+                            f"reply with `uv run --project ../chat "
+                            f"../chat/issues.py reply {owner}/{repo}"
+                            f"#{number} \"<text>\" --quote {latest}` "
+                            f"if a reply is warranted, else stay silent"
+                        ),
+                    )
+                    log.info("backfill %s: %d comment(s)", key, len(others))
+                    _emit(key, payload, rc=False)
+                chan_state[key] = {
+                    "seen": {
+                        c["id"] for c in comments if isinstance(c.get("id"), int)
+                    }
+                }
+                subscriptions.set_baseline(key, now_iso())
+                return
+            rid2 = chanlib.parse_rc_room_key(key)
+            if rid2 is not None:
+                rtype = room_types.get(rid2, str(entry.get("rtype", "c")))
+                try:
+                    msgs = chanlib.backfill_rc_room(
+                        client, rid2, rtype, username_me
+                    )
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("backfill %s failed: %s", key, exc)
+                    return
+                if msgs:
+                    payload = _build_prompt(
+                        key,
+                        msgs,
+                        channel=key,
+                        inbound="backfill",
+                        suggested=(
+                            f"reply with `uv run --project ../chat "
+                            f"../chat/channel.py post rid:{rid2} \"<text>\"` "
+                            f"if a reply is warranted, else stay silent"
+                        ),
+                    )
+                    log.info("backfill %s: %d message(s)", key, len(msgs))
+                    _emit(key, payload, rc=False)
+                chan_state[key] = {
+                    "cursor": max(
+                        [m.get("ts") or "" for m in msgs] or [now_iso()]
+                    ),
+                    "seen": {str(m.get("_id")) for m in msgs if m.get("_id")},
+                    "rid": rid2,
+                    "type": rtype,
+                }
+                subscriptions.set_baseline(key, now_iso())
+                return
+            log.warning("backfill: unknown channel kind %s", key)
+
+        def _poll_channel(key: str) -> None:
+            """Steady-state poll for one accepted channel (no-op if unknown)."""
+            st = chan_state.get(key)
+            if st is None:
+                return
+            if "seen" in st and "rid" not in st:
+                # gitea:issue channel
+                parsed = chanlib.parse_issue_key(key)
+                if parsed is None or gitea_token is None:
+                    return
+                owner, repo, number = parsed
+                try:
+                    fresh = [
+                        c
+                        for c in chanlib.poll_gitea_issue(
+                            gitea_server,
+                            gitea_token,
+                            owner,
+                            repo,
+                            number,
+                            max(list(st["seen"]) or [-1]),
+                        )
+                        if ((c.get("user") or {}).get("login") or "") != username_me
+                    ]
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("poll %s failed: %s", key, exc)
+                    return
+                for c in fresh:
+                    st["seen"].add(int(c["id"]))
+                if not fresh:
+                    return
+                latest = max(int(c["id"]) for c in fresh)
+                payload = _build_prompt(
+                    key,
+                    [_comment_as_message(c) for c in fresh],
+                    channel=key,
+                    inbound=", ".join(f"comment {c.get('id')}" for c in fresh),
+                    suggested=(
+                        f"reply with `uv run --project ../chat "
+                        f"../chat/issues.py reply {owner}/{repo}"
+                        f"#{number} \"<text>\" --quote {latest}` "
+                        f"if a reply is warranted, else stay silent"
+                    ),
+                )
+                log.info("channel hit %d comment(s) on %s", len(fresh), key)
+                _emit(key, payload, rc=False)
+                return
+            if "rid" in st:
+                try:
+                    fresh = [
+                        m
+                        for m in chanlib.poll_rc_room(
+                            client,
+                            str(st["rid"]),
+                            str(st.get("type", "c")),
+                            str(st.get("cursor") or ""),
+                            username_me,
+                        )
+                        if str(m.get("_id")) not in st["seen"]
+                    ]
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("poll %s failed: %s", key, exc)
+                    return
+                for m in fresh:
+                    if m.get("_id"):
+                        st["seen"].add(str(m.get("_id")))
+                if not fresh:
+                    return
+                if fresh:
+                    st["cursor"] = max(
+                        st.get("cursor") or "", *[m.get("ts") or "" for m in fresh]
+                    )
+                payload = _build_prompt(
+                    key,
+                    sorted(fresh, key=lambda m: m.get("ts") or ""),
+                    channel=key,
+                    inbound=", ".join(
+                        str(m.get("_id") or m.get("ts") or "?") for m in fresh
+                    ),
+                    suggested=(
+                        f"reply with `uv run --project ../chat "
+                        f"../chat/channel.py post rid:{st['rid']} \"<text>\"` "
+                        f"if a reply is warranted, else stay silent"
+                    ),
+                )
+                log.info("channel hit %d message(s) on %s", len(fresh), key)
+                _emit(key, payload, rc=False)
+
+        def _discovery_tick() -> None:
+            """Announce new channels, adopt accepts, drop destroyed ones."""
+            # --- discover ---
+            found: dict[str, str] = {}  # key -> human detail
+            try:
+                for room in chanlib.discover_rc_rooms(client):
+                    if room["key"] == demo_key:
+                        continue
+                    room_types[room["rid"]] = room["type"]
+                    found[room["key"]] = f"#{room['name']} ({room['type']})"
+            except (requests.RequestException, RuntimeError, TypeError) as exc:
+                log.warning("RC discovery failed: %s", exc)
+            if gitea_token is not None:
+                try:
+                    for iss in chanlib.discover_gitea_issues(gitea_server, gitea_token):
+                        if iss["key"] == demo_key:
+                            continue
+                        found[iss["key"]] = str(iss.get("title") or "")
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("Gitea discovery failed: %s", exc)
+            for key, detail in found.items():
+                if subscriptions.mark_announced(key):
+                    log.info("new channel announced: %s", key)
+                    _dispatch_control("available", key, detail)
+            # --- adopt accepts (backfill once) ---
+            for key, entry in subscriptions.active().items():
+                if (
+                    key == demo_key
+                    or not isinstance(entry, dict)
+                    or not (entry.get("announced") and entry.get("baseline") is None)
+                    or key in chan_state
+                ):
+                    continue
+                log.info("accepted channel, backfilling: %s", key)
+                _backfill_channel(key, entry)
+            # --- destroy detection ---
+            for key in list(subscriptions.active()):
+                if key == demo_key:
+                    continue
+                alive = True
+                rid3 = chanlib.parse_rc_room_key(key)
+                parsed3 = chanlib.parse_issue_key(key)
+                try:
+                    if rid3 is not None:
+                        alive = chanlib.check_rc_room(client, rid3)
+                    elif (
+                        parsed3 is not None and gitea_token is not None
+                    ):
+                        o3, r3, n3 = parsed3
+                        alive = chanlib.check_gitea_issue(
+                            gitea_server, gitea_token, o3, r3, n3
+                        )
+                    else:
+                        continue
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("destroy check %s failed: %s", key, exc)
+                    continue
+                if not alive and subscriptions.mark_destroyed(key):
+                    chan_state.pop(key, None)
+                    log.info("channel destroyed, subscription removed: %s", key)
+                    _dispatch_control("destroyed", key, "")
+
         def _start_watcher() -> threading.Thread:
             """Run one push subscription in a daemon thread; errors -> inbox."""
 
@@ -640,6 +928,23 @@ def main(
             # (observed 25s+ blackout), while sleep() interrupts immediately.
             # 0.2s bounds push→dispatch latency.
             time.sleep(0.2)
+            # Subscription engine tick: discovery/announce/adopt/destroy on
+            # the slow cadence; per-channel polls share the issue cadence.
+            if time.monotonic() - last_discovery >= discovery_interval:
+                last_discovery = time.monotonic()
+                try:
+                    _discovery_tick()
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("discovery tick failed: %s", exc)
+            if time.monotonic() - last_channel_poll >= issue_interval:
+                last_channel_poll = time.monotonic()
+                for key in list(subscriptions.active()):
+                    if key == demo_key or key.startswith("rc:dm:"):
+                        continue
+                    try:
+                        _poll_channel(key)
+                    except (requests.RequestException, RuntimeError, TypeError) as exc:
+                        log.warning("channel poll %s failed: %s", key, exc)
             if (
                 issue_target is not None
                 and time.monotonic() - last_issue_poll >= issue_interval

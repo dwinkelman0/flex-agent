@@ -63,6 +63,16 @@ Rules:
 - **Proper Solution**: standardized timeout policy/helper for chat/.
 - **Trigger**: next time a timeout-related bug is observed.
 
+### Inject channel catalog on agent idle (spare-cycle soak)
+- **Shortcut**: the catalog is only announced on channel creation and on
+  explicit `channel catalog` runs; an idle agent with undecided channels
+  sits unused.
+- **Proper Solution**: gateway detects agent idleness (session idle AND
+  nothing pending across all subscribed channels) and injects the
+  undecided catalog as a prompt.
+- **Trigger**: first time an agent sits idle >5 min while the catalog
+  holds unhandled entries.
+
 ## PENDING
 
 ### Dump per-process logs to /tmp

@@ -53,6 +53,25 @@ uv run --project ../chat ../chat/channel.py post <room> "text" [--thread TMID]
 plugin-owned for DM replies — use `channel.py` (not `dm post`) whenever
 you post deliberately, including to rooms.
 
+## Channels — subscribing and unsubscribing
+
+Beyond your mandatory DM you can follow extra channels (Rocket.Chat rooms,
+Gitea issues). Channel keys look like `rc:room:<rid>` or
+`gitea:issue:<owner>/<repo>#<n>`:
+
+```
+uv run --project ../chat ../chat/channel.py catalog        # awaiting your decision
+uv run --project ../chat ../chat/channel.py subscribe <key>  # accept: replays history, then live
+uv run --project ../chat ../chat/channel.py unsubscribe <key>  # leave, or decline an offer
+```
+
+The gateway announces new channels with a `[control: channel-available]`
+prompt — accept or decline explicitly; silence decides nothing and the
+channel never dispatches until accepted. Accept-on-new replays from the
+beginning; subscribing later only delivers newer items. If a channel is
+destroyed the gateway removes it and tells you (`[control:
+channel-destroyed]`). The dedicated DM cannot be unsubscribed.
+
 Run Python tools via `uv run --project ../chat` (bare `python` is not on
 PATH and system `python3` lacks the project deps — both fail silently
 from your shell, so always use the `uv run` form above).

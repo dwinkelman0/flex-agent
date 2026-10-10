@@ -12,8 +12,13 @@ from typing import Any
 
 
 def now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string."""
-    return datetime.now(UTC).isoformat()
+    """Return the current UTC time as an ISO-8601 string.
+
+    Normalized to second precision with a ``Z`` suffix: some Rocket.Chat
+    history endpoints (``channels.history``) reject microseconds or
+    ``+00:00`` offsets that ``im.history`` tolerates.
+    """
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def age_seconds(ts: str) -> float:
