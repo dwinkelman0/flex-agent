@@ -136,12 +136,17 @@ def _build_prompt(
     *,
     channel: str | None = None,
     inbound: str | None = None,
+    suggested: str | None = None,
 ) -> dict[str, Any]:
     """Build a prompt payload with a provenance envelope header.
 
     The header names the channel and inbound item(s) so the agent knows
     where input came from; the trailer states the reply contract (toolkit
-    for non-RC channels, plain text auto-forwarded only with RC input).
+    for non-RC channels, plain text auto-forwarded only with RC input)
+    plus a per-input suggested action. Standing rules, repeated every
+    turn because they are cheaper than misfires: never narrate actions
+    in chat ("posting reply…", "replied on…"), and never answer your own
+    messages (tool echoes are not new input).
     """
     lines = [_format_prompt_line(m) for m in messages]
     body = "\n".join(lines)
@@ -149,17 +154,20 @@ def _build_prompt(
         header = f"[channel: {channel}]"
         if inbound is not None:
             header += f" [inbound: {inbound}]"
-        body = (
-            f"{header}\n{body}\n"
-            "---\n"
+        trailer = (
             "Reply actions are yours to decide: use the gateway toolkit "
             "(`uv run --project ../chat ../chat/issues.py reply`, "
             "`uv run --project ../chat ../chat/channel.py post`) for "
             "non-RocketChat channels (bare `python` is not on PATH — "
             "always use the `uv run` form). Plain assistant text is "
             "forwarded to the RocketChat DM only when this turn includes "
-            "RocketChat input."
+            "RocketChat input. Do not narrate actions in chat; act "
+            "silently via tools. Your own messages may echo back through "
+            "polling — they are not new input, never answer them."
         )
+        if suggested:
+            trailer += f"\nSuggested action: {suggested}"
+        body = f"{header}\n{body}\n---\n{trailer}"
     return {"peer": peer, "prompt": body, "messages": len(lines)}
 
 
@@ -518,6 +526,10 @@ def main(
                 inbound=", ".join(
                     str(m.get("_id") or m.get("ts") or "?") for m in siblings
                 ),
+                suggested=(
+                    "answer in plain assistant text (auto-forwarded to the "
+                    "DM). If nothing needs saying, stay silent"
+                ),
             )
             log.info(
                 "dispatching %d message(s) latest_ts=%s",
@@ -660,14 +672,29 @@ def main(
                         issue_seen_ids.add(int(c["id"]))
                     channel_peer = f"gitea:{issue_owner}/{issue_repo}#{issue_number}"
                     thread = f"issue {issue_number}"
+                    # Echo suppression: the agent's own replies come back
+                    # through polling; they are not new input.
+                    others = [
+                        c
+                        for c in fresh
+                        if ((c.get("user") or {}).get("login") or "") != username_me
+                    ]
+                    if not others:
+                        log.debug("issue hit only own echo; skipping dispatch")
+                        continue
+                    latest = max(int(c["id"]) for c in others)
                     payload = _build_prompt(
                         channel_peer,
-                        [_comment_as_message(c) for c in fresh],
+                        [_comment_as_message(c) for c in others],
                         channel=channel_peer,
-                        inbound=", ".join(
-                            f"comment {c.get('id')}" for c in fresh
-                        )
+                        inbound=", ".join(f"comment {c.get('id')}" for c in others)
                         + f" [thread: {thread}]",
+                        suggested=(
+                            f"reply with `uv run --project ../chat "
+                            f"../chat/issues.py reply {issue_owner}/{issue_repo}"
+                            f"#{issue_number} \"<text>\" --quote {latest}` "
+                            f"if a reply is warranted, else stay silent"
+                        ),
                     )
                     log.info(
                         "issue hit %d comment(s) on %s",
