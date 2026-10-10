@@ -102,8 +102,12 @@ SERVE_PID=$!
 cd "$ROOT"
 
 echo "start-dev: gateway ($PEER -> 127.0.0.1:$PORT, ephemeral, DEBUG)" >&2
+# Demo wiring: statically subscribed to the dwinkelman/demo#1 issue —
+# comments there dispatch as gitea: prompts alongside DMs. Final form
+# will be dynamic (subscription API); this hardcoding is demo-only.
 PEER_USERNAME="$PEER" uv run --project "$ROOT/chat" chat/gateway.py "$PEER" \
   --opencode-url "http://127.0.0.1:$PORT" \
+  --issue dwinkelman/demo#1 \
   --ephemeral --log-level DEBUG &
 GATEWAY_PID=$!
 # The python child of `uv run` (signals to the uv wrapper itself are

@@ -2,11 +2,19 @@
  * rocketchat.ts — opencode plugin that bridges agent turns to Rocket.Chat.
  *
  * Outer-loop contract (runtime):
- *   The outer loop owns the long poll: it calls `chat/client.py dm listen`
- *   on startup and dispatches each inbound message to the agent as a prompt
- *   immediately. The agent only ever calls `dm list-recent` itself when it
- *   needs to reconcile (see AGENTS.md escape hatch). This plugin only
- *   *forwards* outbound agent events back to the DM room; it never listens.
+ *   The outer loop owns inbound: it watches subscribed channels (Rocket.Chat
+ *   DM push, Gitea issue polls) and dispatches each hit as a prompt
+ *   immediately, with a provenance envelope header. The agent only ever
+ *   calls `dm list-recent` itself when it needs to reconcile (see AGENTS.md
+ *   escape hatch).
+ *
+ * Routing policy (see agent/turn-origins.json, written by the gateway):
+ *   (a) turn includes Rocket.Chat input → forward all emitted text to the
+ *       DM (may also use other channels via the toolkit — not precluded).
+ *   (b) otherwise → stay silent; the agent owns zero-or-more response
+ *       actions via the gateway toolkit (`issues.py reply`,
+ *       `channel.py post`).
+ * Only root sessions ever forward (child/subagent chatter stays internal).
  *
  * Hooks (opencode 1.18 bus events):
  *   permission.updated → "?? <title>"      (deduped by permission id)
@@ -32,7 +40,28 @@ const CLIENT_PY = path.join(REPO_ROOT, "chat", "client.py")
 
 // Prefer the project's venv python (bare `python` is often absent on PATH);
 // fall back to python3, then python.
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
+
+// Turn origins, written by the gateway on every dispatch
+// (agent/turn-origins.json): {sessionID: {rc: bool, channels: [...]}}.
+// Rule (a): a turn with at least one RocketChat input is forwarded here.
+// Rule (b): anything else is the agent's job via the gateway toolkit
+// (issues.py reply, channel.py post) — the plugin stays silent.
+const ORIGINS_PATH = path.join(REPO_ROOT, "agent", "turn-origins.json")
+
+function sessionHasRcOrigin(sessionID: string): boolean {
+  try {
+    if (!existsSync(ORIGINS_PATH)) return true // no gateway yet: old behavior
+    const raw = readFileSync(ORIGINS_PATH, "utf-8")
+    const table = JSON.parse(raw) as Record<string, { rc?: unknown }>
+    const entry = table[sessionID]
+    if (entry == null) return true // not gateway-dispatched: old behavior
+    return entry.rc === true
+  } catch (err) {
+    debug(`origins lookup failed for ${sessionID}:`, err)
+    return true
+  }
+}
 
 const VENV_PY = path.join(REPO_ROOT, "chat", ".venv", "bin", "python")
 const PYTHON = existsSync(VENV_PY) ? VENV_PY : "python3"
@@ -227,6 +256,13 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
                     markPosted(mid)
                     return
                   }
+                  // Rule (b): no RocketChat input this turn → the agent
+                  // owns response actions via the toolkit; stay silent.
+                  if (!sessionHasRcOrigin(sid)) {
+                    debug(`rule (b): no RC origin for ${sid}; not forwarding`)
+                    markPosted(mid)
+                    return
+                  }
                   // Re-check: idle may have posted this block while we awaited.
                   if (postedBlocks.has(mid)) return
                   const id = `${sid}:${mid}`
@@ -270,6 +306,10 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
           debug(`skip permission from child session ${sid}`)
           return
         }
+        if (sid && !sessionHasRcOrigin(sid)) {
+          debug(`rule (b): no RC origin for ${sid}; not forwarding permission`)
+          return
+        }
         const perm = props as unknown as {
           id?: string
           title?: string
@@ -294,6 +334,10 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
         const errSid = props.sessionID as string | undefined
         if (errSid && !(await isRootSession(errSid))) {
           debug(`skip error from child session ${errSid}`)
+          return
+        }
+        if (errSid && !sessionHasRcOrigin(errSid)) {
+          debug(`rule (b): no RC origin for ${errSid}; not forwarding error`)
           return
         }
         const id =
@@ -331,6 +375,14 @@ export const RocketchatPlugin: Plugin = async ({ $ }) => {
         }
         if (!(await isRootSession(sessionID))) {
           debug(`skip idle from child session ${sessionID}`)
+          for (const mid of orderBySession.get(sessionID) ?? []) {
+            markPosted(mid)
+            textByMessage.delete(mid)
+          }
+          return
+        }
+        if (!sessionHasRcOrigin(sessionID)) {
+          debug(`rule (b): no RC origin for ${sessionID}; not forwarding`)
           for (const mid of orderBySession.get(sessionID) ?? []) {
             markPosted(mid)
             textByMessage.delete(mid)

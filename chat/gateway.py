@@ -130,9 +130,99 @@ def _fetch_siblings(
     return peer_msgs
 
 
-def _build_prompt(peer: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_prompt(
+    peer: str,
+    messages: list[dict[str, Any]],
+    *,
+    channel: str | None = None,
+    inbound: str | None = None,
+) -> dict[str, Any]:
+    """Build a prompt payload with a provenance envelope header.
+
+    The header names the channel and inbound item(s) so the agent knows
+    where input came from; the trailer states the reply contract (toolkit
+    for non-RC channels, plain text auto-forwarded only with RC input).
+    """
     lines = [_format_prompt_line(m) for m in messages]
-    return {"peer": peer, "prompt": "\n".join(lines), "messages": len(lines)}
+    body = "\n".join(lines)
+    if channel is not None:
+        header = f"[channel: {channel}]"
+        if inbound is not None:
+            header += f" [inbound: {inbound}]"
+        body = (
+            f"{header}\n{body}\n"
+            "---\n"
+            "Reply actions are yours to decide: use the gateway toolkit "
+            "(`uv run --project ../chat ../chat/issues.py reply`, "
+            "`uv run --project ../chat ../chat/channel.py post`) for "
+            "non-RocketChat channels (bare `python` is not on PATH — "
+            "always use the `uv run` form). Plain assistant text is "
+            "forwarded to the RocketChat DM only when this turn includes "
+            "RocketChat input."
+        )
+    return {"peer": peer, "prompt": body, "messages": len(lines)}
+
+
+ORIGINS_PATH = config.REPO_ROOT / "agent" / "turn-origins.json"
+
+
+def _record_turn_origin(sid: str, *, rc: bool, channels: list[str]) -> None:
+    """Persist {session_id: {rc, channels}} for the plugin's (a)/(b) rule.
+
+    Atomic write; merges with existing entries. Best-effort: a failure
+    here must never block dispatch (plugin defaults to forwarding).
+    """
+    try:
+        existing: dict[str, object] = {}
+        if ORIGINS_PATH.is_file():
+            loaded = json.loads(ORIGINS_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        merged = dict(existing)
+        prev = merged.get(sid)
+        prev_channels: list[str] = []
+        prev_rc = False
+        if isinstance(prev, dict):
+            raw = prev.get("channels")
+            if isinstance(raw, list):
+                prev_channels = [str(c) for c in raw]
+            prev_rc = bool(prev.get("rc"))
+        merged[sid] = {
+            "rc": bool(rc) or prev_rc,
+            "channels": sorted(set(prev_channels) | set(channels)),
+        }
+        tmp = ORIGINS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, ORIGINS_PATH)
+    except OSError as exc:
+        print(f"warning: could not record turn origin: {exc}", file=sys.stderr)
+
+
+def _fetch_issue_comments(
+    server: str, token: str, owner: str, repo: str, number: int
+) -> list[dict[str, Any]]:
+    """Return all comments on a Gitea issue (ascending by id)."""
+    resp = requests.get(
+        f"{server}/api/v1/repos/{owner}/{repo}/issues/{number}/comments",
+        headers={"Authorization": f"token {token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    comments = resp.json()
+    if not isinstance(comments, list):
+        raise TypeError(f"unexpected comments payload: {comments!r}")
+    return sorted(comments, key=lambda c: c.get("id") or 0)
+
+
+def _comment_as_message(comment: dict[str, Any]) -> dict[str, Any]:
+    """Shape a Gitea comment like a chat message for prompt formatting."""
+    user = comment.get("user") or {}
+    return {
+        "ts": comment.get("created_at") or comment.get("updated_at") or "",
+        "u": {"username": user.get("login") or "unknown"},
+        "msg": comment.get("body") or "",
+        "_id": f"gitea-comment-{comment.get('id')}",
+    }
 
 
 class _OpenCodeDispatcher:
@@ -169,13 +259,15 @@ class _OpenCodeDispatcher:
         resp.raise_for_status()
         self.session_id = None
 
-    def dispatch(self, payload: dict[str, Any]) -> None:
+    def dispatch(self, payload: dict[str, Any], *, channel: str, rc: bool) -> str:
         sid = self._ensure_session()
         url = f"{self.base_url}/session/{sid}/prompt_async"
         text = str(payload.get("prompt") or "")
         body = {"parts": [{"type": "text", "text": text}]}
         resp = requests.post(url, json=body, auth=self.auth, timeout=30)
         resp.raise_for_status()
+        _record_turn_origin(sid, rc=rc, channels=[channel])
+        return sid
 
 
 def _dispatch(
@@ -183,12 +275,14 @@ def _dispatch(
     payload: dict[str, Any],
     *,
     dry_run: bool,
-) -> None:
+    channel: str,
+    rc: bool,
+) -> str | None:
     if dry_run or dispatcher is None:
         click.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return
+        return None
     assert dispatcher is not None  # narrow for type-checkers
-    dispatcher.dispatch(payload)
+    return dispatcher.dispatch(payload, channel=channel, rc=rc)
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -242,6 +336,20 @@ def _dispatch(
     default=False,
     help="DELETE the opencode session on shutdown so no server-side state persists.",
 )
+@click.option(
+    "--issue",
+    "issue_target",
+    default=None,
+    help="Demo-scoped static subscription: OWNER/REPO#N whose new comments "
+    "are also dispatched as prompts (no registry file yet).",
+)
+@click.option(
+    "--issue-interval",
+    default=5.0,
+    show_default=True,
+    type=float,
+    help="Seconds between issue-comment polls when --issue is set.",
+)
 def main(
     peer: str,
     server: str | None,
@@ -252,6 +360,8 @@ def main(
     dry_run: bool,
     log_level: str,
     ephemeral: bool,
+    issue_target: str | None,
+    issue_interval: float,
 ) -> None:
     """Outer loop: listen for DMs from PEER and dispatch each hit as a prompt.
 
@@ -268,10 +378,46 @@ def main(
     State is observable via stderr logs (stdout stays pure prompt-JSON in
     dry-run mode). Use --log-level DEBUG to watch every hit/dispatch.
     With --ephemeral the opencode session is DELETEed on shutdown.
+    With --issue, new comments on that Gitea issue are dispatched too,
+    labeled with a gitea: channel peer.
     """
     log = _setup_logging(log_level)
     server_url = _resolve_server(server)
     username_me, password = _resolve_creds()
+
+    # Demo-scoped static issue subscription (no registry yet).
+    issue_owner: str | None = None
+    issue_repo: str | None = None
+    issue_number: int | None = None
+    gitea_server = os.environ.get("GITEA_URL") or "http://localhost:3001"
+    gitea_token: str | None = None
+    issue_seen_ids: set[int] = set()
+    last_issue_poll = 0.0
+    if issue_target is not None:
+        try:
+            repo_part, num_part = issue_target.rsplit("#", 1)
+            issue_owner, issue_repo = repo_part.split("/", 1)
+            issue_number = int(num_part)
+        except ValueError:
+            raise click.UsageError(
+                f"--issue must look like OWNER/REPO#N, got {issue_target!r}."
+            ) from None
+        gitea_token = os.environ.get("GITEA_TOKEN")
+        if not gitea_token:
+            gitea_token = config.load_root_env().get("GITEA_TOKEN") or os.environ.get(
+                "GITEA_TOKEN"
+            )
+        if not gitea_token:
+            raise click.ClickException(
+                "GITEA_TOKEN not found; set env or define it in ../.env"
+            )
+        log.info(
+            "issue subscription %s/%s#%d via %s",
+            issue_owner,
+            issue_repo,
+            issue_number,
+            gitea_server,
+        )
     log.info(
         "startup peer=%s server=%s mode=%s ephemeral=%s",
         peer,
@@ -361,16 +507,25 @@ def main(
                     since = primary_ts
                 log.debug("all siblings already seen; floor now %s", since)
                 return
-            payload = _build_prompt(peer, siblings)
+            payload = _build_prompt(
+                peer,
+                siblings,
+                channel=f"dm:{peer}",
+                inbound=", ".join(
+                    str(m.get("_id") or m.get("ts") or "?") for m in siblings
+                ),
+            )
             log.info(
                 "dispatching %d message(s) latest_ts=%s",
                 len(siblings),
                 max((m.get("ts") or "" for m in siblings), default=""),
             )
             try:
-                _dispatch(dispatcher, payload, dry_run=dry_run)
+                sid = _dispatch(
+                    dispatcher, payload, dry_run=dry_run, channel=f"dm:{peer}", rc=True
+                )
                 if dispatcher is not None and not dry_run:
-                    log.info("dispatched to opencode session=%s", dispatcher.session_id)
+                    log.info("dispatched to opencode session=%s", sid)
                 else:
                     log.info("dry-run prompt printed to stdout")
             except (requests.RequestException, RuntimeError, TypeError) as exc:
@@ -435,6 +590,28 @@ def main(
             )
             _dispatch_primary(startup)
 
+        # Baseline the issue subscription at current max id: only comments
+        # posted after startup dispatch as prompts.
+        if issue_target is not None:
+            assert (
+                issue_owner is not None
+                and issue_repo is not None
+                and issue_number is not None
+                and gitea_token is not None
+            )
+            try:
+                for c in _fetch_issue_comments(
+                    gitea_server, gitea_token, issue_owner, issue_repo, issue_number
+                ):
+                    if isinstance(c.get("id"), int):
+                        issue_seen_ids.add(c["id"])
+                log.info(
+                    "issue baseline %s comments seen", len(issue_seen_ids)
+                )
+            except (requests.RequestException, RuntimeError, TypeError) as exc:
+                raise click.ClickException(f"issue baseline failed: {exc}") from exc
+            last_issue_poll = time.monotonic()
+
         auth_token = client.auth_token
         user_id = client.user_id
         if not auth_token or not user_id:
@@ -447,6 +624,75 @@ def main(
             # (observed 25s+ blackout), while sleep() interrupts immediately.
             # 0.2s bounds push→dispatch latency.
             time.sleep(0.2)
+            if (
+                issue_target is not None
+                and time.monotonic() - last_issue_poll >= issue_interval
+            ):
+                last_issue_poll = time.monotonic()
+                assert (
+                    issue_owner is not None
+                    and issue_repo is not None
+                    and issue_number is not None
+                    and gitea_token is not None
+                )
+                try:
+                    fresh = [
+                        c
+                        for c in _fetch_issue_comments(
+                            gitea_server,
+                            gitea_token,
+                            issue_owner,
+                            issue_repo,
+                            issue_number,
+                        )
+                        if isinstance(c.get("id"), int)
+                        and c["id"] not in issue_seen_ids
+                    ]
+                except (requests.RequestException, RuntimeError, TypeError) as exc:
+                    log.warning("issue poll failed: %s", exc)
+                    fresh = []
+                if fresh:
+                    for c in fresh:
+                        issue_seen_ids.add(int(c["id"]))
+                    channel_peer = f"gitea:{issue_owner}/{issue_repo}#{issue_number}"
+                    thread = f"issue {issue_number}"
+                    payload = _build_prompt(
+                        channel_peer,
+                        [_comment_as_message(c) for c in fresh],
+                        channel=channel_peer,
+                        inbound=", ".join(
+                            f"comment {c.get('id')}" for c in fresh
+                        )
+                        + f" [thread: {thread}]",
+                    )
+                    log.info(
+                        "issue hit %d comment(s) on %s",
+                        len(fresh),
+                        channel_peer,
+                    )
+                    try:
+                        sid = _dispatch(
+                            dispatcher,
+                            payload,
+                            dry_run=dry_run,
+                            channel=channel_peer,
+                            rc=False,
+                        )
+                        if dispatcher is not None and not dry_run:
+                            log.info(
+                                "dispatched to opencode session=%s",
+                                sid,
+                            )
+                        else:
+                            log.info("dry-run prompt printed to stdout")
+                    except (
+                        requests.RequestException,
+                        RuntimeError,
+                        TypeError,
+                    ) as exc:
+                        raise click.ClickException(
+                            f"dispatch failed: {exc}"
+                        ) from exc
             try:
                 primary = inbox.get_nowait()
             except queue.Empty:
