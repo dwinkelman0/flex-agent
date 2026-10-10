@@ -6,7 +6,8 @@ Usage::
     python issues.py comment OWNER/REPO#N "text"
     python issues.py reply OWNER/REPO#N "text" [--quote COMMENT_ID]
 
-Authentication: ``GITEA_TOKEN`` env var or repo-root ``.env``.
+Authentication: ``GITEA_TOKEN`` env var, repo-root ``.env``, or the
+per-agent token in ``.agent_env`` (see ``provision_gitea.py``).
 Server: ``GITEA_URL`` env or ``http://localhost:3001``.
 
 Gitea issue comments are flat (no threading); ``reply`` posts a normal
@@ -31,20 +32,24 @@ def _resolve_server(server: str | None) -> str:
 
 
 def _resolve_token() -> str:
+    # Precedence: env, then per-agent .agent_env (provision_gitea.py),
+    # then root .env (usually the admin token). Agent identity wins when
+    # provisioned; admin token remains the fallback.
     token = os.environ.get("GITEA_TOKEN")
+    if not token:
+        token = config.load_agent_env().get("GITEA_TOKEN")
     if not token:
         root_env = config.load_root_env()
         token = os.environ.get("GITEA_TOKEN") or root_env.get("GITEA_TOKEN")
-    # config.load_root_env() loads ../.env into os.environ as a side effect,
-    # so re-check env to cover the file case.
     token = token or os.environ.get("GITEA_TOKEN")
     if not token:
         click.echo(
-            "error: GITEA_TOKEN not found; set env or define it in ../.env",
+            "error: GITEA_TOKEN not found; set env, run provision_gitea.py "
+            "for a per-agent token, or define it in ../.env",
             err=True,
         )
         sys.exit(2)
-    return token
+    return str(token)
 
 
 def _split_target(target: str) -> tuple[str, str, int]:

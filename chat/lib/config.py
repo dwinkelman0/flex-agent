@@ -95,59 +95,49 @@ def synthetic_email(username: str, domain: str | None = None) -> str:
     return f"{username}@{domain}"
 
 
-def write_agent_env(username: str, password: str) -> Path:
-    """Append or update ``USERNAME`` and ``PASSWORD`` in ``.agent_env``.
+def upsert_dotfile_values(path: Path, values: dict[str, str]) -> Path:
+    """Append or update ``values`` keys in the dotfile at ``path``.
 
-    Returns the path that was written. Existing keys are updated in place;
-    missing keys are appended as new lines. The file is created with mode
-    ``0o600`` (owner read/write only). Writes are atomic: content goes to a
-    temp file on the same filesystem and is renamed into place. If the file
-    already exists with loose permissions (any of the lower 7 bits set), a
-    warning is emitted to stderr.
+    Returns the path written. Existing keys are updated in place;
+    missing keys are appended. Atomic write with mode ``0o600``; warns
+    to stderr if the existing file has loose permissions.
     """
-    AGENT_ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     # Warn if the existing file has loose perms.
     try:
-        existing_mode = AGENT_ENV_PATH.stat().st_mode & 0o077
+        existing_mode = path.stat().st_mode & 0o077
     except FileNotFoundError:
         existing_mode = 0
     if existing_mode:
         print(
-            f"warning: {AGENT_ENV_PATH} has loose permissions (mode & 0o077 = "
+            f"warning: {path} has loose permissions (mode & 0o077 = "
             f"{oct(existing_mode)}); rewriting with 0o600",
             file=sys.stderr,
         )
 
     lines: list[str] = []
-    if AGENT_ENV_PATH.is_file():
-        lines = AGENT_ENV_PATH.read_text(encoding="utf-8").splitlines()
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8").splitlines()
 
-    updated = {"USERNAME": False, "PASSWORD": False}
+    updated = dict.fromkeys(values, False)
     new_lines: list[str] = []
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            new_lines.append(line)
-            continue
-        if "=" not in line:
+        if not stripped or stripped.startswith("#") or "=" not in line:
             new_lines.append(line)
             continue
         key, _, _ = line.partition("=")
         key = key.strip()
-        if key == "USERNAME":
-            new_lines.append(f"USERNAME={username}")
-            updated["USERNAME"] = True
-        elif key == "PASSWORD":
-            new_lines.append(f"PASSWORD={password}")
-            updated["PASSWORD"] = True
+        if key in values:
+            new_lines.append(f"{key}={values[key]}")
+            updated[key] = True
         else:
             new_lines.append(line)
 
-    if not updated["USERNAME"]:
-        new_lines.append(f"USERNAME={username}")
-    if not updated["PASSWORD"]:
-        new_lines.append(f"PASSWORD={password}")
+    for key, seen in updated.items():
+        if not seen:
+            new_lines.append(f"{key}={values[key]}")
 
     content = "\n".join(new_lines)
     if not content.endswith("\n"):
@@ -155,15 +145,15 @@ def write_agent_env(username: str, password: str) -> Path:
 
     # Atomic write with mode 0o600.
     fd, tmp_path = tempfile.mkstemp(
-        prefix=".agent_env.",
-        dir=str(AGENT_ENV_PATH.parent),
+        prefix=path.name + ".",
+        dir=str(path.parent),
         text=True,
     )
     try:
         os.write(fd, content.encode("utf-8"))
         os.fchmod(fd, 0o600)
         os.close(fd)
-        os.replace(tmp_path, AGENT_ENV_PATH)
+        os.replace(tmp_path, path)
     except BaseException:
         try:
             os.close(fd)
@@ -174,4 +164,15 @@ def write_agent_env(username: str, password: str) -> Path:
         except OSError:
             pass
         raise
-    return AGENT_ENV_PATH
+    return path
+
+
+def write_agent_env(username: str, password: str) -> Path:
+    """Append or update ``USERNAME`` and ``PASSWORD`` in ``.agent_env``.
+
+    Returns the path that was written. See :func:`upsert_dotfile_values`
+    for the atomicity/permission guarantees.
+    """
+    return upsert_dotfile_values(
+        AGENT_ENV_PATH, {"USERNAME": username, "PASSWORD": password}
+    )

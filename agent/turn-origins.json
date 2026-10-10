@@ -1,4 +1,10 @@
 {
+  "ses_ed9b1bd19ffexpbnrfJ7YdPggJ": {
+    "channels": [
+      "dm:dwinkelman"
+    ],
+    "rc": true
+  },
   "ses_edcc400b9fferxBVHehEa5XfIQ": {
     "channels": [
       "gitea:dwinkelman/demo#1"

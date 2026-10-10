@@ -402,14 +402,18 @@ def main(
             raise click.UsageError(
                 f"--issue must look like OWNER/REPO#N, got {issue_target!r}."
             ) from None
+        # Precedence: env, per-agent .agent_env, then root .env (admin).
         gitea_token = os.environ.get("GITEA_TOKEN")
+        if not gitea_token:
+            gitea_token = config.load_agent_env().get("GITEA_TOKEN")
         if not gitea_token:
             gitea_token = config.load_root_env().get("GITEA_TOKEN") or os.environ.get(
                 "GITEA_TOKEN"
             )
         if not gitea_token:
             raise click.ClickException(
-                "GITEA_TOKEN not found; set env or define it in ../.env"
+                "GITEA_TOKEN not found; set env, run provision_gitea.py, "
+                "or define it in ../.env"
             )
         log.info(
             "issue subscription %s/%s#%d via %s",
