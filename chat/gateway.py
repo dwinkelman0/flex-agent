@@ -366,6 +366,14 @@ def _dispatch(
     type=float,
     help="Seconds between channel discovery/destroy sweeps.",
 )
+@click.option(
+    "--webhook-port",
+    default=0,
+    show_default=True,
+    type=int,
+    help="Serve Gitea webhook deliveries on 127.0.0.1:PORT (push instead "
+    "of polling). 0 disables. Secret from GITEA_WEBHOOK_SECRET.",
+)
 def main(
     peer: str,
     server: str | None,
@@ -379,6 +387,7 @@ def main(
     issue_target: str | None,
     issue_interval: float,
     discovery_interval: float,
+    webhook_port: int,
 ) -> None:
     """Outer loop: listen for DMs from PEER and dispatch each hit as a prompt.
 
@@ -449,6 +458,30 @@ def main(
         )
     # The dedicated DM is mandatory and always active.
     subscriptions.subscribe(f"rc:dm:{peer}", announced=False, now_iso=now_iso())
+    # Webhook receiver (push): deliveries land in hook_inbox as
+    # (channel_key, [items], delivery_id). Polling stays as fallback.
+    hook_inbox: queue.Queue[tuple[str, list[dict[str, Any]], str]] = queue.Queue()
+    hook_seen: set[str] = set()
+    if webhook_port:
+        webhook_secret = os.environ.get("GITEA_WEBHOOK_SECRET")
+        if not webhook_secret:
+            webhook_secret = config.load_root_env().get(
+                "GITEA_WEBHOOK_SECRET"
+            ) or os.environ.get("GITEA_WEBHOOK_SECRET")
+        if not webhook_secret:
+            raise click.ClickException(
+                "GITEA_WEBHOOK_SECRET not found (env or ../.env); "
+                "required with --webhook-port"
+            )
+        from lib import gitea_hooks
+
+        def _on_hook(event: str, delivery: str, payload: dict[str, Any]) -> None:
+            channel, items = gitea_hooks.normalize_event(event, payload)
+            if channel and items:
+                hook_inbox.put((channel, items, delivery or ""))
+
+        gitea_hooks.start_receiver(webhook_port, webhook_secret, _on_hook)
+        log.info("webhook receiver on 127.0.0.1:%d", webhook_port)
     log.info(
         "startup peer=%s server=%s mode=%s ephemeral=%s",
         peer,
@@ -468,6 +501,15 @@ def main(
         )
 
     stop = threading.Event()
+
+    # Platform health (independent of any channel): polled data paths are
+    # skipped while the corresponding push path is healthy. rc_healthy
+    # tracks the DM DDP watch; gitea_healthy tracks the authed platform
+    # ping below. Both default True (fail-open: poll until proven push).
+    rc_healthy = True
+    gitea_healthy = True
+    last_gitea_ping = 0.0
+    gitea_ping_interval = 60.0
 
     def _shutdown(reason: str) -> None:
         log.info("shutdown (%s)", reason)
@@ -586,6 +628,31 @@ def main(
                 raise click.ClickException(f"re-login failed: {exc}") from exc
             log.debug("auth token refreshed user=%s", username_me)
             return uid, token
+
+        def _gitea_ping() -> None:
+            """Authenticated platform ping: proves server AND credentials.
+
+            Runs on its own slow cadence, independent of any channel. Flips
+            gitea_healthy; polled data paths stand down while healthy and
+            the webhook receiver is on.
+            """
+            nonlocal gitea_healthy
+            assert gitea_token is not None
+            try:
+                resp = requests.get(
+                    f"{gitea_server}/api/v1/user",
+                    headers={"Authorization": f"token {gitea_token}"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+            except (requests.RequestException, ValueError) as exc:
+                if gitea_healthy:
+                    log.warning("gitea platform ping failed: %s", exc)
+                gitea_healthy = False
+                return
+            if not gitea_healthy:
+                log.info("gitea platform recovered")
+            gitea_healthy = True
 
         def _emit(channel: str, payload: dict[str, Any], rc: bool) -> None:
             """Shared dispatch + logging for channel prompts."""
@@ -707,12 +774,20 @@ def main(
             log.warning("backfill: unknown channel kind %s", key)
 
         def _poll_channel(key: str) -> None:
-            """Steady-state poll for one accepted channel (no-op if unknown)."""
+            """Steady-state poll for one accepted channel (no-op if unknown).
+
+            Skipped while the corresponding push path is healthy; the
+            platform ping + watcher state decide, never per-channel
+            silence tracking.
+            """
             st = chan_state.get(key)
             if st is None:
                 return
             if "seen" in st and "rid" not in st:
                 # gitea:issue channel
+                if webhook_port and gitea_healthy:
+                    log.debug("push healthy; skipping poll %s", key)
+                    return
                 parsed = chanlib.parse_issue_key(key)
                 if parsed is None or gitea_token is None:
                     return
@@ -729,12 +804,14 @@ def main(
                             max(list(st["seen"]) or [-1]),
                         )
                         if ((c.get("user") or {}).get("login") or "") != username_me
+                        and f"{key}:{c.get('id')}" not in hook_seen
                     ]
                 except (requests.RequestException, RuntimeError, TypeError) as exc:
                     log.warning("poll %s failed: %s", key, exc)
                     return
                 for c in fresh:
                     st["seen"].add(int(c["id"]))
+                    hook_seen.add(f"{key}:{c.get('id')}")
                 if not fresh:
                     return
                 latest = max(int(c["id"]) for c in fresh)
@@ -860,6 +937,13 @@ def main(
             """Run one push subscription in a daemon thread; errors -> inbox."""
 
             def _run() -> None:
+                nonlocal rc_healthy
+
+                def _state(s: str) -> None:
+                    nonlocal rc_healthy
+                    rc_healthy = s == "connected"
+                    log.debug("rc push state: %s", s)
+
                 try:
                     uid, token = _refresh_login()
                     watch_room(
@@ -870,6 +954,7 @@ def main(
                         uid,
                         inbox.put,
                         stop_event=stop,
+                        on_state=_state,
                     )
                 except (
                     click.ClickException,
@@ -922,12 +1007,81 @@ def main(
             raise click.ClickException("login did not yield auth token/user id")
         _start_watcher()
 
+        def _emit_issue_batch(
+            owner: str, repo: str, number: int, comments: list[dict[str, Any]]
+        ) -> None:
+            """Dispatch one prompt for fresh issue comments (echo-suppressed)."""
+            channel_peer = f"gitea:{owner}/{repo}#{number}"
+            thread = f"issue {number}"
+            # Echo suppression: the agent's own replies come back through
+            # polling and webhooks; they are not new input.
+            others = [
+                c
+                for c in comments
+                if ((c.get("user") or {}).get("login") or "") != username_me
+            ]
+            if not others:
+                log.debug("issue hit only own echo; skipping dispatch")
+                return
+            latest = max(int(c["id"]) for c in others if isinstance(c.get("id"), int))
+            payload = _build_prompt(
+                channel_peer,
+                [_comment_as_message(c) for c in others],
+                channel=channel_peer,
+                inbound=", ".join(f"comment {c.get('id')}" for c in others)
+                + f" [thread: {thread}]",
+                suggested=(
+                    f"reply with `uv run --project ../chat "
+                    f"../chat/issues.py reply {owner}/{repo}"
+                    f"#{number} \"<text>\" --quote {latest}` "
+                    f"if a reply is warranted, else stay silent"
+                ),
+            )
+            log.info(
+                "issue hit %d comment(s) on %s",
+                len(others),
+                channel_peer,
+            )
+            try:
+                sid = _dispatch(
+                    dispatcher,
+                    payload,
+                    dry_run=dry_run,
+                    channel=channel_peer,
+                    rc=False,
+                )
+                if dispatcher is not None and not dry_run:
+                    log.info(
+                        "dispatched to opencode session=%s",
+                        sid,
+                    )
+                else:
+                    log.info("dry-run prompt printed to stdout")
+            except (
+                requests.RequestException,
+                RuntimeError,
+                TypeError,
+            ) as exc:
+                raise click.ClickException(
+                    f"dispatch failed: {exc}"
+                ) from exc
+
         while True:
             # NOTE: sleep-poll, not inbox.get(): on this platform a thread
             # parked in Queue/lock acquisition does not take SIGINT promptly
             # (observed 25s+ blackout), while sleep() interrupts immediately.
             # 0.2s bounds push→dispatch latency.
             time.sleep(0.2)
+            # Platform ping (Gitea): authenticated, channel-independent.
+            # While the webhook receiver is on and the ping is healthy,
+            # polled data paths stand down; otherwise they resume.
+            if (
+                webhook_port
+                and gitea_token is not None
+                and time.monotonic() - last_gitea_ping >= gitea_ping_interval
+            ):
+                last_gitea_ping = time.monotonic()
+                _gitea_ping()
             # Subscription engine tick: discovery/announce/adopt/destroy on
             # the slow cadence; per-channel polls share the issue cadence.
             if time.monotonic() - last_discovery >= discovery_interval:
@@ -947,6 +1101,7 @@ def main(
                         log.warning("channel poll %s failed: %s", key, exc)
             if (
                 issue_target is not None
+                and (not webhook_port or not gitea_healthy)
                 and time.monotonic() - last_issue_poll >= issue_interval
             ):
                 last_issue_poll = time.monotonic()
@@ -975,60 +1130,70 @@ def main(
                 if fresh:
                     for c in fresh:
                         issue_seen_ids.add(int(c["id"]))
-                    channel_peer = f"gitea:{issue_owner}/{issue_repo}#{issue_number}"
-                    thread = f"issue {issue_number}"
-                    # Echo suppression: the agent's own replies come back
-                    # through polling; they are not new input.
-                    others = [
-                        c
-                        for c in fresh
-                        if ((c.get("user") or {}).get("login") or "") != username_me
-                    ]
-                    if not others:
-                        log.debug("issue hit only own echo; skipping dispatch")
+                    assert (
+                        issue_owner is not None
+                        and issue_repo is not None
+                        and issue_number is not None
+                    )
+                    _emit_issue_batch(issue_owner, issue_repo, issue_number, fresh)
+            # Webhook push drain (non-blocking). Poll paths consult
+            # hook_seen (and issue_seen_ids for the demo key) so push and
+            # poll never double-deliver the same item.
+            while True:
+                try:
+                    h_channel, h_items, h_delivery = hook_inbox.get_nowait()
+                except queue.Empty:
+                    break
+                new_items = []
+                for it in h_items:
+                    ident = f"{h_channel}:{it.get('id')}"
+                    if ident in hook_seen:
                         continue
-                    latest = max(int(c["id"]) for c in others)
-                    payload = _build_prompt(
-                        channel_peer,
-                        [_comment_as_message(c) for c in others],
-                        channel=channel_peer,
-                        inbound=", ".join(f"comment {c.get('id')}" for c in others)
-                        + f" [thread: {thread}]",
-                        suggested=(
-                            f"reply with `uv run --project ../chat "
-                            f"../chat/issues.py reply {issue_owner}/{issue_repo}"
-                            f"#{issue_number} \"<text>\" --quote {latest}` "
-                            f"if a reply is warranted, else stay silent"
-                        ),
+                    hook_seen.add(ident)
+                    if isinstance(it.get("id"), int) and h_channel == demo_key:
+                        issue_seen_ids.add(int(it["id"]))
+                    new_items.append(it)
+                if not new_items:
+                    continue
+                log.info(
+                    "webhook hit %d item(s) on %s (delivery %s)",
+                    len(new_items),
+                    h_channel,
+                    h_delivery,
+                )
+                parsed_hook = chanlib.parse_issue_key(h_channel)
+                if parsed_hook is not None:
+                    ho, hr, hn = parsed_hook
+                    _emit_issue_batch(ho, hr, hn, new_items)
+                    continue
+                thread = f"channel {h_channel}"
+                payload = _build_prompt(
+                    h_channel,
+                    [_comment_as_message(c) for c in new_items],
+                    channel=h_channel,
+                    inbound=", ".join(str(c.get("id")) for c in new_items)
+                    + f" [thread: {thread}]",
+                    suggested=(
+                        "reply via the gateway toolkit if warranted, "
+                        "else stay silent"
+                    ),
+                )
+                try:
+                    _dispatch(
+                        dispatcher,
+                        payload,
+                        dry_run=dry_run,
+                        channel=h_channel,
+                        rc=False,
                     )
-                    log.info(
-                        "issue hit %d comment(s) on %s",
-                        len(fresh),
-                        channel_peer,
-                    )
-                    try:
-                        sid = _dispatch(
-                            dispatcher,
-                            payload,
-                            dry_run=dry_run,
-                            channel=channel_peer,
-                            rc=False,
-                        )
-                        if dispatcher is not None and not dry_run:
-                            log.info(
-                                "dispatched to opencode session=%s",
-                                sid,
-                            )
-                        else:
-                            log.info("dry-run prompt printed to stdout")
-                    except (
-                        requests.RequestException,
-                        RuntimeError,
-                        TypeError,
-                    ) as exc:
-                        raise click.ClickException(
-                            f"dispatch failed: {exc}"
-                        ) from exc
+                except (
+                    requests.RequestException,
+                    RuntimeError,
+                    TypeError,
+                ) as exc:
+                    raise click.ClickException(
+                        f"dispatch failed: {exc}"
+                    ) from exc
             try:
                 primary = inbox.get_nowait()
             except queue.Empty:

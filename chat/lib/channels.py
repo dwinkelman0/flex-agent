@@ -205,11 +205,18 @@ def check_gitea_issue(server: str, token: str, owner: str, repo: str, number: in
 
 
 def parse_issue_key(key: str) -> tuple[str, str, int] | None:
-    """``gitea:issue:o/r#n`` -> (owner, repo, number); else None."""
-    if not key.startswith("gitea:issue:"):
+    """``gitea:[issue:]o/r#n`` -> (owner, repo, number); else None.
+
+    Accepts both the canonical ``gitea:issue:`` form and the shorter
+    ``gitea:`` form the gateway demo path emits; they denote the same
+    channel.
+    """
+    rest = key[len("gitea:"):] if key.startswith("gitea:") else None
+    if rest is None:
         return None
+    rest = rest.removeprefix("issue:")
     try:
-        repo_part, num_part = key[len("gitea:issue:"):].rsplit("#", 1)
+        repo_part, num_part = rest.rsplit("#", 1)
         owner, repo = repo_part.split("/", 1)
         return owner, repo, int(num_part)
     except ValueError:

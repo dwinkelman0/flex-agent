@@ -1,2 +1,5 @@
 .env
 .agent_env
+# Runtime state (gateway-written, per-run): never commit.
+agent/subscriptions.json
+agent/turn-origins.json

@@ -74,6 +74,8 @@ def watch_room(
     stop_event: threading.Event | None = None,
     timeout: float | None = None,
     max_reconnects: int = 5,
+    idle_timeout: float = 90.0,
+    on_state: Callable[[str], None] | None = None,
 ) -> None:
     """Subscribe to ``rid`` on the DDP stream and invoke ``on_message`` per peer msg.
 
@@ -82,13 +84,26 @@ def watch_room(
     for ``rid``, then dispatches each incoming peer message (EJSON-normalized)
     to ``on_message``. Messages authored by ``self_user_id`` are skipped.
 
-    Server ``ping`` frames are answered with ``pong``. On connection drop, the
-    client reconnects up to ``max_reconnects`` times with exponential backoff
-    before re-raising. A ``stop_event`` being set or a ``timeout`` elapsing
-    ends the loop cleanly.
+    Server ``ping`` frames are answered with ``pong``. ``idle_timeout``
+    bounds silence: if no frame of any kind arrives within it, a
+    ``RuntimeError`` escapes immediately (no blind resubscribe loops —
+    the caller falls back to poll and resubscribes). ``on_state`` reports
+    ``connected``/``degraded``/``down`` transitions for platform-health
+    gating upstream. On connection drop, the client reconnects up to
+    ``max_reconnects`` times with exponential backoff before re-raising.
+    A ``stop_event`` being set or a ``timeout`` elapsing ends the loop
+    cleanly.
     """
     if stop_event is None:
         stop_event = threading.Event()
+
+    def _state(s: str) -> None:
+        try:
+            if on_state is not None:
+                on_state(s)
+        except Exception as exc:  # noqa: BLE001 -- callback must not break the watch
+            print(f"warning: on_state callback failed: {exc}", file=sys.stderr)
+
     ws_url = _ws_url(server_url)
     deadline = None if timeout is None else time.monotonic() + timeout
     reconnects = 0
@@ -104,6 +119,8 @@ def watch_room(
             _do_connect(ws)
             _do_login(ws, auth_token)
             _do_subscribe(ws, rid)
+            _state("connected")
+            last_frame = time.monotonic()
 
             while True:
                 if stop_event.is_set():
@@ -122,7 +139,12 @@ def watch_room(
                 except websocket.WebSocketTimeoutException:
                     if deadline is not None and time.monotonic() >= deadline:
                         return
+                    if time.monotonic() - last_frame > idle_timeout:
+                        raise RuntimeError(
+                            f"DDP idle past {idle_timeout:.0f}s with no frames"
+                        )
                     continue
+                last_frame = time.monotonic()
                 if not raw:
                     raise RuntimeError("DDP connection closed: empty frame")
                 try:
@@ -182,7 +204,9 @@ def watch_room(
         ) as exc:
             reconnects += 1
             if reconnects > max_reconnects:
+                _state("down")
                 raise
+            _state("degraded")
             backoff = min(30.0, 0.5 * (2 ** (reconnects - 1)))
             print(
                 f"warning: DDP connection lost ({exc}); "

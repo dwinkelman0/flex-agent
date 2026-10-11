@@ -105,9 +105,17 @@ echo "start-dev: gateway ($PEER -> 127.0.0.1:$PORT, ephemeral, DEBUG)" >&2
 # Demo wiring: statically subscribed to the dwinkelman/demo#1 issue —
 # comments there dispatch as gitea: prompts alongside DMs. Final form
 # will be dynamic (subscription API); this hardcoding is demo-only.
+# WEBHOOK_PORT enables the Gitea push receiver (needs GITEA_WEBHOOK_SECRET
+# in env/.env byte-matching the secret on the repo webhook). Default 3030
+# (the port repo webhooks point at); 0 keeps poll-only behavior. While
+# push is healthy (receiver on + authed platform ping green), Gitea data
+# polls stand down to a safety net that fires only after push silence;
+# lifecycle checks (discovery/destroy) always run.
+WEBHOOK_PORT="${WEBHOOK_PORT:-3030}"
 PEER_USERNAME="$PEER" uv run --project "$ROOT/chat" chat/gateway.py "$PEER" \
   --opencode-url "http://127.0.0.1:$PORT" \
   --issue dwinkelman/demo#1 \
+  --webhook-port "$WEBHOOK_PORT" \
   --ephemeral --log-level DEBUG &
 GATEWAY_PID=$!
 # The python child of `uv run` (signals to the uv wrapper itself are
