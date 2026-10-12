@@ -12,7 +12,23 @@ PEER="${1:-dwinkelman}"
 PORT="${OPENCODE_PORT:-4096}"
 # Opencode serve verbosity (that "global event connected" INFO line and friends
 # come from opencode itself). Override with OPENCODE_LOG_LEVEL=INFO to quieten.
-OPENCODE_LOG_LEVEL="${OPENCODE_LOG_LEVEL:-DEBUG}"
+OPENCODE_LOG_LEVEL="${OPENCODE_LOG_LEVEL:-debug}"
+# opencode 2.x requires lowercase log-level values.
+OPENCODE_LOG_LEVEL=$(printf '%s' "$OPENCODE_LOG_LEVEL" | tr '[:upper:]' '[:lower:]')
+
+# opencode 2.x requires HTTP Basic auth (opencode:<password>) on /api when
+# OPENCODE_SERVER_PASSWORD is set. Generate a single shared value so both the
+# server and gateway see the same password; export it so both children inherit it.
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    OPENCODE_SERVER_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  else
+    OPENCODE_SERVER_PASSWORD="$(openssl rand -hex 32)"
+  fi
+fi
+export OPENCODE_SERVER_PASSWORD
+
+echo "start-dev: opencode API auth enabled (Basic opencode:****)" >&2
 
 command -v uv >/dev/null 2>&1 || {
   echo "error: uv not on PATH" >&2

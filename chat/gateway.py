@@ -12,8 +12,8 @@ Dispatch semantics:
   ``[@ts] user: text`` lines and dispatched as a single prompt.
 * No timers, sleeps, or batching windows are introduced between hits; any
   single chat message triggers exactly one prompt dispatch.
-* ``--opencode-url``: POST the prompt to ``/session/:id/prompt_async``
-  (creating the session once via ``/session``, Basic auth from
+* ``--opencode-url``: POST the prompt to ``/api/session/:id/prompt``
+  (creating the session once via ``/api/session``, Basic auth from
   ``OPENCODE_SERVER_PASSWORD``).
 * Otherwise (or with ``--dry-run``): print the prompt JSON to stdout.
 
@@ -247,13 +247,16 @@ class _OpenCodeDispatcher:
     def _ensure_session(self) -> str:
         if self.session_id is not None:
             return self.session_id
-        url = f"{self.base_url}/session"
-        resp = requests.post(url, auth=self.auth, timeout=30)
+        url = f"{self.base_url}/api/session"
+        resp = requests.post(url, json={}, auth=self.auth, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        sid = data.get("id") or data.get("session_id")
+        if not isinstance(data, dict):
+            raise TypeError(f"opencode /api/session did not return a JSON object: {data!r}")
+        payload = data.get("data") or {}
+        sid = payload.get("id") or data.get("id") or data.get("session_id")
         if not isinstance(sid, str):
-            raise TypeError(f"opencode /session did not return an id: {data!r}")
+            raise TypeError(f"opencode /api/session did not return an id: {data!r}")
         self.session_id = sid
         return sid
 
@@ -261,7 +264,7 @@ class _OpenCodeDispatcher:
         """DELETE the gateway session so no server-side state persists."""
         if self.session_id is None:
             return
-        url = f"{self.base_url}/session/{self.session_id}"
+        url = f"{self.base_url}/api/session/{self.session_id}"
         # Short timeout: dispose runs during teardown races when the server
         # may already be half-dead; never let it stall shutdown.
         resp = requests.delete(url, auth=self.auth, timeout=10)
@@ -270,9 +273,9 @@ class _OpenCodeDispatcher:
 
     def dispatch(self, payload: dict[str, Any], *, channel: str, rc: bool) -> str:
         sid = self._ensure_session()
-        url = f"{self.base_url}/session/{sid}/prompt_async"
+        url = f"{self.base_url}/api/session/{sid}/prompt"
         text = str(payload.get("prompt") or "")
-        body = {"parts": [{"type": "text", "text": text}]}
+        body = {"text": text}
         resp = requests.post(url, json=body, auth=self.auth, timeout=30)
         resp.raise_for_status()
         _record_turn_origin(sid, rc=rc, channels=[channel])
