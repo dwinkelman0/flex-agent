@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+# flex-agent agent image
+# Runtime user: dev (non-root). uv and opencode are installed system-wide in
+# /usr/local/bin so they remain on PATH after `USER dev`.
+#
+# No framework clone: /opt/flex-agent is a host bind-mount at runtime
+# (see -v in docker/run-agent.sh), so the image carries toolchain only.
+# (Plan: flip back to a clone-based stable image once that lands.)
+FROM debian:trixie-slim
+
+# Pinned toolchain versions. Override at build time, e.g.:
+#   docker build --build-arg UV_VERSION=0.13.0 \
+#                --build-arg OPENCODE_VERSION=2.0.26 \
+#                -f docker/Dockerfile.agent -t flex-agent .
+ARG UV_VERSION=0.13.0
+ARG OPENCODE_VERSION=2.0.26
+
+# Create the runtime user early so every later file operation can be owned by dev.
+RUN groupadd -r dev && useradd -m -s /bin/bash -g dev dev
+
+# ONE apt transaction: only what the agent image needs. No dist-upgrade.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        ca-certificates \
+        curl \
+        python3 \
+        python-is-python3 \
+        nodejs \
+        npm \
+        supervisor && \
+    mkdir -p /var/log/flex-agent && \
+    chown dev:dev /var/log/flex-agent && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install uv system-wide. UV_INSTALL_DIR forces /usr/local/bin (never /root/.local/bin).
+RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-installer.sh" \
+        | UV_INSTALL_DIR=/usr/local/bin sh
+
+# Install opencode system-wide from the official v2 install script.
+# The script installs into $HOME/.opencode/bin by default; we move the binary to
+# /usr/local/bin so it stays on PATH after `USER dev`, and skip PATH mutation.
+RUN curl -fsSL https://opencode.ai/v2/install | \
+        bash -s -- --version "${OPENCODE_VERSION}" --no-modify-path && \
+    mv "$HOME/.opencode/bin/opencode" /usr/local/bin/opencode && \
+    chmod +x /usr/local/bin/opencode && \
+    rm -rf "$HOME/.opencode"
+
+# Framework mount points. The repo itself arrives via host bind-mount;
+# repo Python/Node deps warm into it on first boot (docker/entrypoint.sh).
+RUN mkdir -p /opt/flex-agent /opt/docker /workspace && \
+    chown dev:dev /opt/flex-agent /opt/docker /workspace
+
+# Supervisor + entrypoint live OUTSIDE the repo mount so a stale or partial
+# host checkout can never shadow them.
+COPY --chown=dev:dev docker/supervisord.conf /opt/docker/supervisord.conf
+COPY --chown=dev:dev docker/logprefix.py /opt/docker/logprefix.py
+RUN chmod +x /opt/docker/logprefix.py
+COPY --chown=dev:dev docker/entrypoint.sh /opt/docker/entrypoint.sh
+RUN chmod +x /opt/docker/entrypoint.sh
+
+USER dev
+WORKDIR /workspace
+ENTRYPOINT ["/opt/docker/entrypoint.sh"]
+CMD ["--supervise"]

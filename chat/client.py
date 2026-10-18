@@ -9,12 +9,12 @@ Authentication resolution:
 
 * ``--server`` / ``ROCKETCHAT_URL`` env / repo-root ``.env`` (``ROCKETCHAT_URL``)
   for the server URL
-* ``USERNAME`` / ``PASSWORD`` env vars, else keys in ``.agent_env``
+* ``ROCKETCHAT_AGENT_USERNAME`` / ``ROCKETCHAT_AGENT_PASSWORD`` env vars
+  (legacy ``USERNAME`` / ``PASSWORD``), else the same keys in ``.agent_env``
 """
 
 from __future__ import annotations
 
-import os
 import signal
 import sys
 import threading
@@ -34,15 +34,18 @@ def _resolve_server(server: str | None) -> str:
 
 
 def _resolve_creds() -> tuple[str, str]:
-    username = os.environ.get("USERNAME")
-    password = os.environ.get("PASSWORD")
-    if not username or not password:
-        agent_env = config.load_agent_env()
-        username = username or agent_env.get("USERNAME")
-        password = password or agent_env.get("PASSWORD")
+    agent_env = config.load_agent_env()
+    username = config.getenv_compat(
+        "ROCKETCHAT_AGENT_USERNAME", "USERNAME", dotfile=agent_env
+    )
+    password = config.getenv_compat(
+        "ROCKETCHAT_AGENT_PASSWORD", "PASSWORD", dotfile=agent_env
+    )
     if not username or not password:
         click.echo(
-            "error: credentials not found; set USERNAME/PASSWORD env or provision via .agent_env",
+            "error: credentials not found; set ROCKETCHAT_AGENT_USERNAME/"
+            "ROCKETCHAT_AGENT_PASSWORD env (legacy USERNAME/PASSWORD still "
+            "supported) or provision via .agent_env",
             err=True,
         )
         sys.exit(2)

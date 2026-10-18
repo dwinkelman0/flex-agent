@@ -30,8 +30,9 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 def load_root_env() -> dict[str, str | None]:
     """Load the repo-root ``.env`` into ``os.environ`` and return its values.
 
-    Keys of interest: ``ROCKETCHAT_URL``, ``ROCKETCHAT_USER``,
-    ``ROCKETCHAT_PASSWORD``.
+    Keys of interest: ``ROCKETCHAT_URL``, ``ROCKETCHAT_ADMIN_USER``
+    (legacy ``ROCKETCHAT_USER``), ``ROCKETCHAT_ADMIN_PASSWORD`` (legacy
+    ``ROCKETCHAT_PASSWORD``).
     """
     values: dict[str, str | None] = {}
     if ROOT_ENV_PATH.is_file():
@@ -43,13 +44,39 @@ def load_root_env() -> dict[str, str | None]:
 def load_agent_env() -> dict[str, str | None]:
     """Return values from the ``.agent_env`` dotfile at the repo root.
 
-    Keys of interest: ``USERNAME``, ``PASSWORD``. Does not mutate
+    Keys of interest: ``ROCKETCHAT_AGENT_USERNAME`` (legacy ``USERNAME``),
+    ``ROCKETCHAT_AGENT_PASSWORD`` (legacy ``PASSWORD``). Does not mutate
     ``os.environ``; callers decide whether to export. Returns ``{}`` when
     the file is missing.
     """
     if not AGENT_ENV_PATH.is_file():
         return {}
     return dotenv_values(AGENT_ENV_PATH)
+
+
+def getenv_compat(
+    new: str, *olds: str, dotfile: dict[str, str | None] | None = None
+) -> str | None:
+    """Resolve a canonical env var with deprecated fallbacks.
+
+    Resolution order:
+
+    1. ``new`` from ``os.environ``
+    2. ``new`` from ``dotfile`` (if provided)
+    3. Each old name from ``os.environ`` (in order)
+    4. Each old name from ``dotfile`` (in order)
+
+    The first truthy value wins. Returns ``None`` when nothing is set.
+    """
+    sources = [os.environ]
+    if dotfile is not None:
+        sources.append(dotfile)
+    for name in (new, *olds):
+        for source in sources:
+            value = source.get(name)
+            if value:
+                return str(value)
+    return None
 
 
 def get_server_url() -> str:
@@ -168,11 +195,20 @@ def upsert_dotfile_values(path: Path, values: dict[str, str]) -> Path:
 
 
 def write_agent_env(username: str, password: str) -> Path:
-    """Append or update ``USERNAME`` and ``PASSWORD`` in ``.agent_env``.
+    """Append or update agent credentials in ``.agent_env``.
 
-    Returns the path that was written. See :func:`upsert_dotfile_values`
-    for the atomicity/permission guarantees.
+    Writes the canonical names ``ROCKETCHAT_AGENT_USERNAME`` /
+    ``ROCKETCHAT_AGENT_PASSWORD`` and keeps the legacy ``USERNAME`` /
+    ``PASSWORD`` keys for backwards compatibility. Returns the path that
+    was written. See :func:`upsert_dotfile_values` for the
+    atomicity/permission guarantees.
     """
     return upsert_dotfile_values(
-        AGENT_ENV_PATH, {"USERNAME": username, "PASSWORD": password}
+        AGENT_ENV_PATH,
+        {
+            "ROCKETCHAT_AGENT_USERNAME": username,
+            "ROCKETCHAT_AGENT_PASSWORD": password,
+            "USERNAME": username,
+            "PASSWORD": password,
+        },
     )

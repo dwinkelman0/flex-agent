@@ -1,5 +1,21 @@
 .env
 .agent_env
+# Local Docker runtime secrets (see docker/*.example): never commit.
+docker/global.env
+docker/agent.env
+# Local bind-mount for the agent container workspace: never commit.
+workspace/
 # Runtime state (gateway-written, per-run): never commit.
 agent/subscriptions.json
 agent/turn-origins.json
+# Python
+__pycache__
+# Plugin dependency tree; keep manifests in git but never node_modules.
+agent/.opencode/node_modules/
+!agent/.opencode/package.json
+!agent/.opencode/package-lock.json
+!agent/.opencode/bun.lock
+# Container-first-boot dependency warming writes here (gitignored).
+chat/.venv/
+# Symlink so serve resolves plugin deps from its cwd (created at runtime).
+agent/node_modules

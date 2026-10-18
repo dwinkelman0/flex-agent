@@ -19,9 +19,11 @@ git config core.hooksPath hooks
 
 ## Provision a user
 
-Reads `USERNAME` and `PASSWORD` from `../.agent_env` (real environment
-variables take precedence if set); uses admin credentials
-from `../.env` (`ROCKETCHAT_USER`, `ROCKETCHAT_PASSWORD`, optional
+Reads `ROCKETCHAT_AGENT_USERNAME` and `ROCKETCHAT_AGENT_PASSWORD` from
+`../.agent_env` (legacy `USERNAME`/`PASSWORD` still supported; real
+environment variables take precedence if set); uses admin credentials
+from `../.env` (`ROCKETCHAT_ADMIN_USER`, `ROCKETCHAT_ADMIN_PASSWORD`,
+legacy `ROCKETCHAT_USER`/`ROCKETCHAT_PASSWORD`, optional
 `ROCKETCHAT_URL`).
 
 ```
@@ -39,16 +41,21 @@ python client.py dm post alice "hello from the agent"
 python client.py dm listen alice --timeout 30
 ```
 
-Auth for `client.py` is resolved from `USERNAME`/`PASSWORD` env vars or the
-`../.agent_env` dotfile. Server URL comes from `--server`, the
+Auth for `client.py` is resolved from `ROCKETCHAT_AGENT_USERNAME`/
+`ROCKETCHAT_AGENT_PASSWORD` env vars (legacy `USERNAME`/`PASSWORD`) or
+the `../.agent_env` dotfile. Server URL comes from `--server`, the
 `ROCKETCHAT_URL` env var, or `../.env`.
 
 ## Gateway (outer loop)
 
 ```
 python gateway.py PEER [--server URL] [--timeout 60] [--interval 1.5] \
-    [--since ISO] [--opencode-url URL] [--dry-run]
+    [--since ISO] [--opencode-url URL] [--dry-run] \
+    [--webhook-port PORT] [--webhook-bind HOST]
 ```
+
+The gateway also honors `ROCKETCHAT_PEER_USERNAME` (legacy
+`PEER_USERNAME`) when resolving the DM peer from the environment.
 
 Runs `dm listen` in-process against `PEER` forever. On startup it enters
 the listen loop immediately — there is no initial `list-recent` call

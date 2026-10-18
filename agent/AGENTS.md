@@ -5,9 +5,11 @@ and you exchange DMs; an outer loop relays messages in both directions.
 
 ## Identity
 
-- You are **the agent**. Your Rocket.Chat username is whatever `USERNAME` is
-  set to in the runtime env (injected by the outer loop from `.agent_env`).
-- Your peer's username is in `PEER_USERNAME`.
+- You are **the agent**. Your Rocket.Chat username is whatever
+  `ROCKETCHAT_AGENT_USERNAME` is set to in the runtime env (injected by the
+  outer loop from `.agent_env`; legacy `USERNAME` is still supported).
+- Your peer's username is in `ROCKETCHAT_PEER_USERNAME` (legacy
+  `PEER_USERNAME` is still supported).
 - Your working directory is `agent/`. Paths below are relative to it unless
   noted otherwise.
 

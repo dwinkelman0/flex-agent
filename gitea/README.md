@@ -24,9 +24,10 @@ agent replies via `chat/issues.py`.
    `GITEA_TOKEN=<token>` (gitignored).
 4. Agent users (optional, one per agent): run from `chat/` —
    ```
-   USERNAME=<agent> PASSWORD=<secret> python provision_gitea.py
+   ROCKETCHAT_AGENT_USERNAME=<agent> ROCKETCHAT_AGENT_PASSWORD=<secret> python provision_gitea.py
    ```
-   This creates the Gitea user (admin API) and mints an `agent` token
+   (Legacy `USERNAME`/`PASSWORD` are still supported.) This creates the
+   Gitea user (admin API) and mints an `agent` token
    via the agent's own BasicAuth, storing it as `GITEA_TOKEN` in
    `.agent_env`. Consumers prefer `.agent_env` over root `.env`, so the
    agent acts as itself; the admin token remains the fallback.
@@ -35,11 +36,13 @@ agent replies via `chat/issues.py`.
    Put the same secret in root `.env` as `GITEA_WEBHOOK_SECRET`
    (gitignored), then run the gateway with the receiver on:
    ```
-   WEBHOOK_PORT=3030 ./start-dev.sh
+   GITEA_WEBHOOK_PORT=3030 GITEA_WEBHOOK_BIND=127.0.0.1 ./start-dev.sh
    ```
-   Deliveries are HMAC-SHA256 verified; bad signatures get 401.
-   Covered events: `issue_comment`, `issues`, `pull_request`, `push`
-   (see `chat/lib/gitea_hooks.py`). Polling stays as fallback.
+   `GITEA_WEBHOOK_BIND` defaults to `127.0.0.1`; the legacy
+   `WEBHOOK_PORT` name is still accepted for the port. Deliveries are
+   HMAC-SHA256 verified; bad signatures get 401. Covered events:
+   `issue_comment`, `issues`, `pull_request`, `push` (see
+   `chat/lib/gitea_hooks.py`). Polling stays as fallback.
 
 ## Persistence
 

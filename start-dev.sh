@@ -39,7 +39,7 @@ if [ ! -f "$ROOT/chat/pyproject.toml" ]; then
   exit 2
 fi
 if [ ! -f "$ROOT/.agent_env" ]; then
-  echo "error: $ROOT/.agent_env missing; define USERNAME/PASSWORD there first" >&2
+  echo "error: $ROOT/.agent_env missing; define ROCKETCHAT_AGENT_USERNAME/ROCKETCHAT_AGENT_PASSWORD there first" >&2
   exit 2
 fi
 command -v opencode >/dev/null 2>&1 || {
@@ -113,7 +113,8 @@ echo "start-dev: opencode serve (cwd=agent/, port=$PORT, peer=$PEER)" >&2
 cd "$ROOT/agent"
 # OPENCODE_PORT lets the rocketchat plugin tell root sessions from child
 # (subagent) sessions via the local API; PEER_USERNAME is the DM target.
-PEER_USERNAME="$PEER" OPENCODE_PORT="$PORT" opencode serve --port "$PORT" --hostname 127.0.0.1 --print-logs --log-level "$OPENCODE_LOG_LEVEL" &
+OPENCODE_HOSTNAME="${OPENCODE_HOSTNAME:-127.0.0.1}"
+PEER_USERNAME="$PEER" OPENCODE_PORT="$PORT" opencode serve --port "$PORT" --hostname "$OPENCODE_HOSTNAME" --print-logs --log-level "$OPENCODE_LOG_LEVEL" &
 SERVE_PID=$!
 cd "$ROOT"
 
@@ -121,17 +122,19 @@ echo "start-dev: gateway ($PEER -> 127.0.0.1:$PORT, ephemeral, DEBUG)" >&2
 # Demo wiring: statically subscribed to the dwinkelman/demo#1 issue —
 # comments there dispatch as gitea: prompts alongside DMs. Final form
 # will be dynamic (subscription API); this hardcoding is demo-only.
-# WEBHOOK_PORT enables the Gitea push receiver (needs GITEA_WEBHOOK_SECRET
+# GITEA_WEBHOOK_PORT enables the Gitea push receiver (needs GITEA_WEBHOOK_SECRET
 # in env/.env byte-matching the secret on the repo webhook). Default 3030
 # (the port repo webhooks point at); 0 keeps poll-only behavior. While
 # push is healthy (receiver on + authed platform ping green), Gitea data
 # polls stand down to a safety net that fires only after push silence;
 # lifecycle checks (discovery/destroy) always run.
-WEBHOOK_PORT="${WEBHOOK_PORT:-3030}"
+GITEA_WEBHOOK_PORT="${GITEA_WEBHOOK_PORT:-${WEBHOOK_PORT:-3030}}"
+GITEA_WEBHOOK_BIND="${GITEA_WEBHOOK_BIND:-127.0.0.1}"
 PEER_USERNAME="$PEER" uv run --project "$ROOT/chat" chat/gateway.py "$PEER" \
   --opencode-url "http://127.0.0.1:$PORT" \
   --issue dwinkelman/demo#1 \
-  --webhook-port "$WEBHOOK_PORT" \
+  --webhook-port "$GITEA_WEBHOOK_PORT" \
+  --webhook-bind "$GITEA_WEBHOOK_BIND" \
   --ephemeral --log-level DEBUG &
 GATEWAY_PID=$!
 # The python child of `uv run` (signals to the uv wrapper itself are

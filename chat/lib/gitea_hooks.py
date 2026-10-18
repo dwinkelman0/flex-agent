@@ -154,6 +154,7 @@ def start_receiver(
     port: int,
     secret: str,
     on_event: Callable[[str, str, dict[str, Any]], None],
+    host: str = "127.0.0.1",
 ) -> threading.Thread:
     """Serve ``/hooks/gitea`` in a daemon thread; returns the thread."""
     handler = type(
@@ -161,7 +162,7 @@ def start_receiver(
         (_Handler,),
         {"secret": secret, "on_event": staticmethod(on_event)},
     )
-    server = HTTPServer(("127.0.0.1", port), handler)
+    server = HTTPServer((host, port), handler)
 
     def _serve() -> None:
         try:

@@ -53,8 +53,7 @@ def _setup_logging(level: str) -> logging.Logger:
     numeric = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
         level=numeric,
-        format="%(asctime)s [gateway] %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
+        format="%(levelname)s %(message)s",
         stream=sys.stderr,
         force=True,
     )
@@ -68,15 +67,18 @@ def _resolve_server(server: str | None) -> str:
 
 
 def _resolve_creds() -> tuple[str, str]:
-    username = os.environ.get("USERNAME")
-    password = os.environ.get("PASSWORD")
-    if not username or not password:
-        agent_env = config.load_agent_env()
-        username = username or agent_env.get("USERNAME")
-        password = password or agent_env.get("PASSWORD")
+    agent_env = config.load_agent_env()
+    username = config.getenv_compat(
+        "ROCKETCHAT_AGENT_USERNAME", "USERNAME", dotfile=agent_env
+    )
+    password = config.getenv_compat(
+        "ROCKETCHAT_AGENT_PASSWORD", "PASSWORD", dotfile=agent_env
+    )
     if not username or not password:
         raise click.ClickException(
-            "credentials not found; set USERNAME/PASSWORD env or provision via .agent_env"
+            "credentials not found; set ROCKETCHAT_AGENT_USERNAME/"
+            "ROCKETCHAT_AGENT_PASSWORD env (legacy USERNAME/PASSWORD still "
+            "supported) or provision via .agent_env"
         )
     return username, password
 
@@ -248,7 +250,18 @@ class _OpenCodeDispatcher:
         if self.session_id is not None:
             return self.session_id
         url = f"{self.base_url}/api/session"
-        resp = requests.post(url, json={}, auth=self.auth, timeout=30)
+        body: dict[str, Any] = {}
+        model_env = os.environ.get("OPENCODE_MODEL", "opencode/longcat-2.5-preview-free")
+        if "/" in model_env:
+            provider_id, model_id = model_env.split("/", 1)
+            body = {
+                "model": {
+                    "providerID": provider_id,
+                    "modelID": model_id,
+                    "id": model_id,
+                }
+            }
+        resp = requests.post(url, json=body, auth=self.auth, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
@@ -277,6 +290,13 @@ class _OpenCodeDispatcher:
         text = str(payload.get("prompt") or "")
         body = {"text": text}
         resp = requests.post(url, json=body, auth=self.auth, timeout=30)
+        if resp.status_code == 404:
+            # Stale session (e.g. server restart): drop cached id, recreate once,
+            # and repost. A second failure surfaces normally.
+            self.session_id = None
+            sid = self._ensure_session()
+            url = f"{self.base_url}/api/session/{sid}/prompt"
+            resp = requests.post(url, json=body, auth=self.auth, timeout=30)
         resp.raise_for_status()
         _record_turn_origin(sid, rc=rc, channels=[channel])
         return sid
@@ -374,8 +394,16 @@ def _dispatch(
     default=0,
     show_default=True,
     type=int,
-    help="Serve Gitea webhook deliveries on 127.0.0.1:PORT (push instead "
-    "of polling). 0 disables. Secret from GITEA_WEBHOOK_SECRET.",
+    help="Serve Gitea webhook deliveries on PORT (push instead of polling). "
+    "0 disables. Bind address from --webhook-bind; secret from "
+    "GITEA_WEBHOOK_SECRET.",
+)
+@click.option(
+    "--webhook-bind",
+    default="127.0.0.1",
+    envvar="GITEA_WEBHOOK_BIND",
+    show_default=True,
+    help="Bind address for the Gitea webhook receiver.",
 )
 def main(
     peer: str,
@@ -391,6 +419,7 @@ def main(
     issue_interval: float,
     discovery_interval: float,
     webhook_port: int,
+    webhook_bind: str,
 ) -> None:
     """Outer loop: listen for DMs from PEER and dispatch each hit as a prompt.
 
@@ -424,13 +453,10 @@ def main(
     last_issue_poll = 0.0
     # Gitea credentials are optional: without them, Gitea discovery and
     # issue polling are skipped (RC-only setups keep working).
-    gitea_token = os.environ.get("GITEA_TOKEN") or None
-    if not gitea_token:
-        gitea_token = config.load_agent_env().get("GITEA_TOKEN")
-    if not gitea_token:
-        gitea_token = config.load_root_env().get("GITEA_TOKEN") or os.environ.get(
-            "GITEA_TOKEN"
-        )
+    gitea_token = (
+        config.getenv_compat("GITEA_TOKEN", dotfile=config.load_agent_env())
+        or config.getenv_compat("GITEA_TOKEN", dotfile=config.load_root_env())
+    )
     if issue_target is not None:
         try:
             repo_part, num_part = issue_target.rsplit("#", 1)
@@ -466,11 +492,9 @@ def main(
     hook_inbox: queue.Queue[tuple[str, list[dict[str, Any]], str]] = queue.Queue()
     hook_seen: set[str] = set()
     if webhook_port:
-        webhook_secret = os.environ.get("GITEA_WEBHOOK_SECRET")
-        if not webhook_secret:
-            webhook_secret = config.load_root_env().get(
-                "GITEA_WEBHOOK_SECRET"
-            ) or os.environ.get("GITEA_WEBHOOK_SECRET")
+        webhook_secret = config.getenv_compat(
+            "GITEA_WEBHOOK_SECRET", dotfile=config.load_root_env()
+        )
         if not webhook_secret:
             raise click.ClickException(
                 "GITEA_WEBHOOK_SECRET not found (env or ../.env); "
@@ -483,8 +507,10 @@ def main(
             if channel and items:
                 hook_inbox.put((channel, items, delivery or ""))
 
-        gitea_hooks.start_receiver(webhook_port, webhook_secret, _on_hook)
-        log.info("webhook receiver on 127.0.0.1:%d", webhook_port)
+        gitea_hooks.start_receiver(
+            webhook_port, webhook_secret, _on_hook, host=webhook_bind
+        )
+        log.info("webhook receiver on %s:%d", webhook_bind, webhook_port)
     log.info(
         "startup peer=%s server=%s mode=%s ephemeral=%s",
         peer,

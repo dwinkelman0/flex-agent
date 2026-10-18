@@ -2,10 +2,12 @@
 
 Target credentials (the user to ensure exists):
 
-* ``USERNAME`` / ``PASSWORD`` from ``.agent_env`` at the repo root,
+* ``ROCKETCHAT_AGENT_USERNAME`` / ``ROCKETCHAT_AGENT_PASSWORD`` (legacy
+  ``USERNAME`` / ``PASSWORD``) from ``.agent_env`` at the repo root,
   with real environment variables taking precedence if both are set.
 
 Admin/server credentials come from the repo-root ``.env`` (``ROCKETCHAT_URL``,
+``ROCKETCHAT_ADMIN_USER``, ``ROCKETCHAT_ADMIN_PASSWORD``; legacy
 ``ROCKETCHAT_USER``, ``ROCKETCHAT_PASSWORD``).
 
 This script only consumes ``.agent_env``; it never writes it.
@@ -19,7 +21,6 @@ Exit codes:
 
 from __future__ import annotations
 
-import os
 import sys
 
 import requests
@@ -27,10 +28,8 @@ from lib import config
 from lib.protocol import RocketChatClient
 
 
-def _resolve_target(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        value = config.load_agent_env().get(name)
+def _resolve_target(name: str, *legacy: str) -> str:
+    value = config.getenv_compat(name, *legacy, dotfile=config.load_agent_env())
     if not value:
         print(
             f"error: required {name} is not set (set env var or define it in .agent_env)",
@@ -41,19 +40,27 @@ def _resolve_target(name: str) -> str:
 
 
 def main() -> int:
-    target_username = _resolve_target("USERNAME")
-    target_password = _resolve_target("PASSWORD")
+    target_username = _resolve_target(
+        "ROCKETCHAT_AGENT_USERNAME", "USERNAME"
+    )
+    target_password = _resolve_target(
+        "ROCKETCHAT_AGENT_PASSWORD", "PASSWORD"
+    )
 
     root_env = config.load_root_env()
     server_url = config.get_server_url()
 
-    admin_user = os.environ.get("ROCKETCHAT_USER") or root_env.get("ROCKETCHAT_USER")
-    admin_pass = os.environ.get("ROCKETCHAT_PASSWORD") or root_env.get(
-        "ROCKETCHAT_PASSWORD"
+    admin_user = config.getenv_compat(
+        "ROCKETCHAT_ADMIN_USER", "ROCKETCHAT_USER", dotfile=root_env
+    )
+    admin_pass = config.getenv_compat(
+        "ROCKETCHAT_ADMIN_PASSWORD", "ROCKETCHAT_PASSWORD", dotfile=root_env
     )
     if not admin_user or not admin_pass:
         print(
-            "error: admin credentials missing (set ROCKETCHAT_USER/ROCKETCHAT_PASSWORD in env or ../.env)",
+            "error: admin credentials missing (set ROCKETCHAT_ADMIN_USER/"
+            "ROCKETCHAT_ADMIN_PASSWORD in env or ../.env; legacy "
+            "ROCKETCHAT_USER/ROCKETCHAT_PASSWORD still supported)",
             file=sys.stderr,
         )
         return 2

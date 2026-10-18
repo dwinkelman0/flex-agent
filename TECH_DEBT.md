@@ -33,22 +33,21 @@ Rules:
 - **Trigger**: next time flaky rocketchat communication is the culprit
   for a bug.
 
-### Manage gateway + serve with systemd instead of bash
-- **Shortcut**: `start-dev.sh` supervises both processes with traps,
-  pid tracking (`pgrep -P` for the `uv` wrapper's python child), and
-  bounded-wait loops.
-- **Proper Solution**: systemd units (or container supervisor) with
-  restart policies, dropping the bash supervision entirely.
-- **Trigger**: when we upgrade to containerization.
-
 ### Standardize environment variables and their provenance
 - **Shortcut**: `.env` / `.agent_env` files plus ad-hoc variables
   (`PEER_USERNAME`, `OPENCODE_PORT`, …) with implicit precedence
   scattered across `chat/lib/config.py` and scripts.
 - **Proper Solution**: documented env schema with provenance (file vs
   env vs default) surfaced at startup.
-- **Trigger**: when we upgrade to containerization or deploy a
-  production-grade rocketchat server.
+- **Status**: RESOLVED for naming — canonical names are now in place
+  (e.g. `ROCKETCHAT_AGENT_USERNAME`, `ROCKETCHAT_ADMIN_PASSWORD`,
+  `ROCKETCHAT_PEER_USERNAME`, `GITEA_WEBHOOK_PORT`, `GITEA_WEBHOOK_BIND`,
+  `OPENCODE_HOSTNAME`) with deprecated-name fallback via
+  `chat/lib/config.py:getenv_compat`. See `docker/global.env.example`
+  and `docker/agent.env.example`.
+- **Compat-shim removal trigger**: when every deployment has migrated
+  to the canonical names and the oldest supported release no longer
+  documents the legacy names.
 
 ### Enable security features for rocketchat and opencode servers
 - **Shortcut**: loopback-only, no password/TLS (gateway logs
@@ -73,17 +72,3 @@ Rules:
 - **Trigger**: first time an agent sits idle >5 min while the catalog
   holds unhandled entries.
 
-## PENDING
-
-### Dump per-process logs to /tmp
-- **Shortcut**: `start-dev.sh` interleaves gateway + serve on one console
-  stream, and the gateway bakes timestamp/process-name into its own log
-  format (`chat/gateway.py`).
-- **Proper Solution**: per-process log files under /tmp (one per process),
-  still streaming to console (e.g. via tee).
-
-### Log hygiene: bare level/message in-process, wrapper adds name+timestamp
-- **Shortcut**: each process formats its own timestamp/name (gateway
-  logging format, opencode native format).
-- **Proper Solution**: processes emit only level/message/etc.; a
-  standardized wrapper adds process name and timestamp.

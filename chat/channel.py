@@ -20,13 +20,13 @@ helpers in ``lib/subscriptions.py``). The dedicated DM is mandatory and
 cannot be unsubscribed. New channels require an explicit accept
 (``subscribe``) or decline (``unsubscribe``); silence decides nothing.
 
-Authentication: ``USERNAME``/``PASSWORD`` env vars or repo-root
-``.agent_env``. Server: ``--server`` / ``ROCKETCHAT_URL`` / ``../.env``.
+Authentication: ``ROCKETCHAT_AGENT_USERNAME``/``ROCKETCHAT_AGENT_PASSWORD``
+env vars (legacy ``USERNAME``/``PASSWORD``) or repo-root ``.agent_env``.
+Server: ``--server`` / ``ROCKETCHAT_URL`` / ``../.env``.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 
 import click
@@ -43,16 +43,18 @@ def _resolve_server(server: str | None) -> str:
 
 
 def _resolve_creds() -> tuple[str, str]:
-    username = os.environ.get("USERNAME")
-    password = os.environ.get("PASSWORD")
-    if not username or not password:
-        agent_env = config.load_agent_env()
-        username = username or agent_env.get("USERNAME")
-        password = password or agent_env.get("PASSWORD")
+    agent_env = config.load_agent_env()
+    username = config.getenv_compat(
+        "ROCKETCHAT_AGENT_USERNAME", "USERNAME", dotfile=agent_env
+    )
+    password = config.getenv_compat(
+        "ROCKETCHAT_AGENT_PASSWORD", "PASSWORD", dotfile=agent_env
+    )
     if not username or not password:
         click.echo(
-            "error: credentials not found; set USERNAME/PASSWORD env "
-            "or provision via .agent_env",
+            "error: credentials not found; set ROCKETCHAT_AGENT_USERNAME/"
+            "ROCKETCHAT_AGENT_PASSWORD env (legacy USERNAME/PASSWORD still "
+            "supported) or provision via .agent_env",
             err=True,
         )
         sys.exit(2)
@@ -137,8 +139,14 @@ def channel_post(room: str, message: str, thread_id: str | None, server: str | N
 
 
 def _gateway_peer() -> str | None:
-    """Best-effort gateway peer for the DM-mandatory guard."""
-    return os.environ.get("GATEWAY_PEER")
+    """Best-effort gateway peer for the DM-mandatory guard.
+
+    Prefers the canonical ``ROCKETCHAT_PEER_USERNAME``; falls back to
+    legacy ``PEER_USERNAME`` and ``GATEWAY_PEER``.
+    """
+    return config.getenv_compat(
+        "ROCKETCHAT_PEER_USERNAME", "PEER_USERNAME", "GATEWAY_PEER"
+    )
 
 
 @cli.command("subscribe")

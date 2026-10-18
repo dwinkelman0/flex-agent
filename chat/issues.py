@@ -35,13 +35,10 @@ def _resolve_token() -> str:
     # Precedence: env, then per-agent .agent_env (provision_gitea.py),
     # then root .env (usually the admin token). Agent identity wins when
     # provisioned; admin token remains the fallback.
-    token = os.environ.get("GITEA_TOKEN")
-    if not token:
-        token = config.load_agent_env().get("GITEA_TOKEN")
-    if not token:
-        root_env = config.load_root_env()
-        token = os.environ.get("GITEA_TOKEN") or root_env.get("GITEA_TOKEN")
-    token = token or os.environ.get("GITEA_TOKEN")
+    token = (
+        config.getenv_compat("GITEA_TOKEN", dotfile=config.load_agent_env())
+        or config.getenv_compat("GITEA_TOKEN", dotfile=config.load_root_env())
+    )
     if not token:
         click.echo(
             "error: GITEA_TOKEN not found; set env, run provision_gitea.py "

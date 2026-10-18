@@ -2,8 +2,9 @@
 
 Mirrors ``provision.py`` (Rocket.Chat), but for Gitea:
 
-* Target credentials (the agent user to ensure): ``USERNAME`` /
-  ``PASSWORD`` from the environment, else ``.agent_env``.
+* Target credentials (the agent user to ensure):
+  ``ROCKETCHAT_AGENT_USERNAME`` / ``ROCKETCHAT_AGENT_PASSWORD`` (legacy
+  ``USERNAME`` / ``PASSWORD``) from the environment, else ``.agent_env``.
 * Admin client: an admin ``GITEA_TOKEN`` from the environment or the
   repo-root ``.env`` (``POST /admin/users`` needs admin scope).
 * Token minting: ``POST /users/{USERNAME}/tokens`` authenticated with the
@@ -29,8 +30,8 @@ TOKEN_NAME = "agent"
 TOKEN_SCOPES = ["write:repository", "write:issue", "read:user", "write:user"]
 
 
-def _require_target(name: str) -> str:
-    value = os.environ.get(name) or config.load_agent_env().get(name)
+def _require_target(name: str, *legacy: str) -> str:
+    value = config.getenv_compat(name, *legacy, dotfile=config.load_agent_env())
     if not value:
         print(
             f"error: required {name} is not set (env var or .agent_env)",
@@ -41,10 +42,10 @@ def _require_target(name: str) -> str:
 
 
 def _admin_token(server: str) -> str:
-    token = os.environ.get("GITEA_TOKEN") or config.load_root_env().get(
-        "GITEA_TOKEN"
+    token = (
+        config.getenv_compat("GITEA_TOKEN", dotfile=config.load_root_env())
+        or os.environ.get("GITEA_TOKEN")
     )
-    token = token or os.environ.get("GITEA_TOKEN")
     if not token:
         print(
             "error: admin GITEA_TOKEN missing (env or ../.env); "
@@ -82,8 +83,8 @@ def _api(
 
 
 def main() -> int:
-    username = _require_target("USERNAME")
-    password = _require_target("PASSWORD")
+    username = _require_target("ROCKETCHAT_AGENT_USERNAME", "USERNAME")
+    password = _require_target("ROCKETCHAT_AGENT_PASSWORD", "PASSWORD")
     server = os.environ.get("GITEA_URL") or "http://localhost:3001"
     server = server.rstrip("/")
     admin_token = _admin_token(server)
